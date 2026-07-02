@@ -19,8 +19,14 @@ import { SupabaseSink } from '../lib/supabase.js';
 import { installFeed } from './feed-inject.js';
 import { OutcomeTracker } from './outcomes.js';
 
-/** Resolves on ENTER (interactive) or SIGINT/SIGTERM (Ctrl+C, systemd stop). */
+/**
+ * Resolves on ENTER (interactive) or SIGINT/SIGTERM (Ctrl+C, systemd stop).
+ * Service mode (PV_SERVICE=1, set by the VPS scheduled task): never resolves —
+ * there is no interactive stop, and an accidental Ctrl+C in the console kills
+ * the process with a NONZERO exit so the task's restart-on-failure revives it.
+ */
 function waitForStop(): Promise<void> {
+  if ((process.env.PV_SERVICE ?? '').trim() === '1') return new Promise(() => { /* run until killed */ });
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const done = () => { rl.close(); resolve(); };

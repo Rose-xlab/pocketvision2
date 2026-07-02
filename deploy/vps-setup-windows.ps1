@@ -28,9 +28,15 @@ npx playwright install chromium
 New-Item -ItemType Directory -Force (Join-Path $root 'logs') | Out-Null
 
 # 3. Scheduled task: start at logon, restart on crash, no time limit.
+# Use npm's FULL path — Task Scheduler's environment predates the Node install
+# and won't see PATH changes until a reboot.
 Write-Host '[4/5] Registering scheduled task "PocketVision"…'
+$npmCmd = Join-Path $env:ProgramFiles 'nodejs\npm.cmd'
+if (-not (Test-Path $npmCmd)) { $npmCmd = (Get-Command npm.cmd).Source }
+# PV_SERVICE=1 → no interactive stop; any exit (even accidental Ctrl+C in the
+# console) is nonzero, so the task's restart-on-failure brings the bot back.
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' `
-  -Argument "/c cd /d `"$root`" && npm run scan >> logs\service.log 2>&1"
+  -Argument "/c set `"PV_SERVICE=1`" && cd /d `"$root`" && `"$npmCmd`" run scan >> logs\service.log 2>&1"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `
