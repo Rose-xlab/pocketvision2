@@ -1,0 +1,26 @@
+# PocketVision scanner — systemd unit (see docs/VPS.md for full setup).
+# Install:  sudo cp deploy/pocketvision.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now pocketvision
+# Logs:     journalctl -u pocketvision -f
+
+[Unit]
+Description=PocketVision Pocket Option scanner (Telegram alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust user + path to your VPS layout.
+User=pocket
+WorkingDirectory=/home/pocket/pocketvision
+# xvfb-run gives the headful Chromium a virtual display (less bot-detectable
+# than headless). If you set HEADLESS=true in .env you can drop xvfb-run.
+ExecStart=/usr/bin/xvfb-run -a /usr/bin/npm run scan
+Restart=always
+RestartSec=30
+# The scanner handles SIGTERM: drains Telegram, closes the browser cleanly.
+TimeoutStopSec=30
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secrets & session — NEVER commit
+.env
+.env.local
+.auth/
+*.session
+
+# Phase 1 spike output (may contain sensitive frame data)
+logs/
+diagnostics/
+
+# OS / editor
+.DS_Store
+Thumbs.db

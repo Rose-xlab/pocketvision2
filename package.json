@@ -1,0 +1,32 @@
+{
+  "name": "pocketvision-scanner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PocketVision AI - Pocket Option candle streak scanner with Telegram alerts (analysis only, never trades).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "login": "tsx src/phase1/login.ts",
+    "spike": "tsx src/phase1/spike.ts",
+    "probe": "tsx src/phase1/probe.ts",
+    "probe:multiconn": "tsx src/phase3/probe-multiconn.ts",
+    "analyze": "tsx src/phase1/analyze.ts",
+    "scan:one": "tsx src/scanner/live-single.ts",
+    "scan": "tsx src/scanner/scan-all.ts",
+    "test:telegram": "tsx src/tools/telegram-test.ts",
+    "report": "tsx src/tools/report.ts",
+    "test:core": "tsx src/scanner/selftest.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.61.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
