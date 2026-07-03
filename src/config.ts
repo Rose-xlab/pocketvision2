@@ -48,10 +48,17 @@ export const config = {
   // ── Multi-pair scan (Phase 3) ──
   /** 'auto' = all open OTC pairs (capped by maxPairs), or a comma list of symbols. */
   watchlist: process.env.WATCHLIST ?? 'auto',
-  /** Safety cap on parallel connections for the first runs. */
-  maxPairs: Number(process.env.MAX_PAIRS ?? 30),
+  /** Safety cap on the watchlist size (rotation makes this cheap — not a socket count). */
+  maxPairs: Number(process.env.MAX_PAIRS ?? 60),
   /** Only auto-track assets whose payout (%) is at least this. */
   minPayout: Number(process.env.MIN_PAYOUT ?? 87),
+  /** Persistent socket pool size — stay under PO's per-IP ceiling (~8 observed). */
+  feedPool: Number(process.env.FEED_POOL ?? 6),
+  /** Seconds each rotating socket dwells on a pair before moving on. */
+  dwellSec: Number(process.env.DWELL_SEC ?? 12),
+  /** Pin a pair to a live socket when its streak reaches threshold − this.
+   *  Larger margin = earlier pinning = a slower sweep stays safe. */
+  pinMargin: Number(process.env.PIN_MARGIN ?? 2),
 
   // ── Reliability (Phase 3 hardening) ──
   /** No ticks for this many seconds → feed is stale: warn + auto-recover. */

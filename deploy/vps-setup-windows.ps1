@@ -37,13 +37,18 @@ if (-not (Test-Path $npmCmd)) { $npmCmd = (Get-Command npm.cmd).Source }
 # console) is nonzero, so the task's restart-on-failure brings the bot back.
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' `
   -Argument "/c set `"PV_SERVICE=1`" && cd /d `"$root`" && `"$npmCmd`" run scan >> logs\service.log 2>&1"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Two triggers: at logon, PLUS a forever-repeating 15-min "revive if dead"
+# (restart-on-failure alone gives up after RestartCount tries — a long PO
+# outage would otherwise leave the bot down permanently).
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$every15 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
+  -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `
   -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Unregister-ScheduledTask -TaskName 'PocketVision' -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName 'PocketVision' -Action $action -Trigger $trigger `
+Register-ScheduledTask -TaskName 'PocketVision' -Action $action -Trigger $logon, $every15 `
   -Settings $settings -RunLevel Highest | Out-Null
 
 # 4. Auto-logon (so a reboot restarts the bot unattended). The password is

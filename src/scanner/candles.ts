@@ -45,6 +45,8 @@ interface Forming {
 
 export class CandleBuilder {
   private readonly forming = new Map<string, Forming>();
+  /** Latest bucket already emitted per symbol — backfill must never re-open it. */
+  private readonly closedThrough = new Map<string, number>();
 
   constructor(
     private readonly timeframeSec = 60,
@@ -62,6 +64,9 @@ export class CandleBuilder {
    */
   addTick(tick: Tick): Candle[] {
     const bucket = this.bucketOf(tick.ts);
+    const done = this.closedThrough.get(tick.symbol);
+    if (done !== undefined && bucket <= done) return []; // stale backfill
+
     const cur = this.forming.get(tick.symbol);
 
     if (!cur) {
@@ -92,12 +97,19 @@ export class CandleBuilder {
    * Time-based close: emit candles whose bucket ended more than `grace` ago,
    * for pairs that have gone quiet (no newer tick to trigger addTick's close).
    * Call periodically (e.g. once a second) with the current epoch seconds.
+   *
+   * `graceFor` overrides the grace per symbol: a live-streamed pair should
+   * close ~instantly (default grace), but a ROTATED pair's candle may still be
+   * completed by the next visit's history backfill — flushing it early would
+   * emit a partial candle with the wrong close. Give those a grace longer
+   * than the sweep period so the data-driven close (backfill) wins.
    */
-  flush(nowSec: number): Candle[] {
+  flush(nowSec: number, graceFor?: (symbol: string) => number): Candle[] {
     const out: Candle[] = [];
     for (const [symbol, cur] of this.forming) {
       const bucketEnd = cur.bucket + this.timeframeSec;
-      if (nowSec >= bucketEnd + this.graceSec) {
+      const grace = graceFor ? graceFor(symbol) : this.graceSec;
+      if (nowSec >= bucketEnd + grace) {
         out.push(this.toCandle(symbol, cur));
         this.forming.delete(symbol);
       }
@@ -110,6 +122,7 @@ export class CandleBuilder {
   }
 
   private toCandle(symbol: string, f: Forming): Candle {
+    this.closedThrough.set(symbol, f.bucket);
     return {
       symbol,
       periodStart: f.bucket,

@@ -6,8 +6,10 @@
  * throttles sends (~1/sec per chat) to stay within Telegram's rate limits.
  *
  * Credentials come from env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — never
- * hardcoded. If unset, the sender degrades to a no-op with a one-time warning so
- * the scanner still runs (console alerts only).
+ * hardcoded. TELEGRAM_CHAT_ID may be a single id or a comma-separated list
+ * (users, groups, or channels); every message goes to each chat. If unset, the
+ * sender degrades to a no-op with a one-time warning so the scanner still runs
+ * (console alerts only).
  */
 import type { StreakAlert } from '../scanner/streaks.js';
 
@@ -52,8 +54,11 @@ export class TelegramSender {
   private timer: NodeJS.Timeout | null = null;
   private warned = false;
 
-  constructor(private readonly token: string, private readonly chatId: string) {
-    this.enabled = Boolean(token && chatId);
+  private readonly chatIds: string[];
+
+  constructor(private readonly token: string, chatId: string) {
+    this.chatIds = chatId.split(',').map((s) => s.trim()).filter(Boolean);
+    this.enabled = Boolean(token && this.chatIds.length > 0);
   }
 
   get isEnabled(): boolean { return this.enabled; }
@@ -76,23 +81,41 @@ export class TelegramSender {
     if (this.queue.length > 0) this.timer = setTimeout(() => void this.flush(), MIN_SEND_INTERVAL_MS);
   }
 
-  /** Send immediately (used for the startup test message). Returns ok. */
+  /** Send immediately to every configured chat. Returns true if ALL succeeded. */
   async send(text: string): Promise<boolean> {
     if (!this.enabled) return false;
+    let allOk = true;
+    for (const chatId of this.chatIds) {
+      if (!(await this.sendTo(chatId, text))) allOk = false;
+    }
+    return allOk;
+  }
+
+  private async sendTo(chatId: string, text: string, attempt = 1): Promise<boolean> {
     try {
       const res = await fetch(`https://api.telegram.org/bot${this.token}/sendMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: this.chatId, text, disable_web_page_preview: true }),
+        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
       });
       if (!res.ok) {
         const body = await res.text().catch(() => '');
-        console.error(`  ! Telegram send failed (${res.status}): ${body.slice(0, 200)}`);
+        // 4xx = our fault (bad chat id etc.) — retrying can't help. 5xx might.
+        if (res.status >= 500 && attempt < 3) {
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
+          return this.sendTo(chatId, text, attempt + 1);
+        }
+        console.error(`  ! Telegram send failed for chat ${chatId} (${res.status}): ${body.slice(0, 200)}`);
         return false;
       }
       return true;
     } catch (err) {
-      console.error(`  ! Telegram send error: ${(err as Error).message}`);
+      // Network blip (fetch failed) — an alert is worth a couple of retries.
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        return this.sendTo(chatId, text, attempt + 1);
+      }
+      console.error(`  ! Telegram send error for chat ${chatId} after ${attempt} tries: ${(err as Error).message}`);
       return false;
     }
   }

@@ -1,12 +1,15 @@
 /**
- * Phase 3 — multi-pair scanner.
+ * Phase 3 — multi-pair scanner (rotating-pool architecture).
  *
  * Keeps one logged-in browser page, lets PO connect (so we capture its auth
- * frame), then opens one Socket.IO connection per watchlist pair via the in-page
- * feed manager. Every pair's tick stream flows through the same candle builder +
- * streak engine; alerts go to the console and Telegram.
+ * frame), then opens a SMALL persistent socket pool via the in-page feed
+ * manager. Each socket rotates across the watchlist with `changeSymbol`; every
+ * visit pulls a 7–10 min history backfill, so streak tracking is gapless for
+ * the WHOLE watchlist with only ~6 connections (PO's per-IP ceiling is ~8).
+ * Pairs whose streak nears the threshold are PINNED to a socket and stream
+ * live, so the alerting candle is always seen in real time.
  *
- * Run:  npm run scan   (set WATCHLIST / MAX_PAIRS / STREAK_THRESHOLD in .env)
+ * Run:  npm run scan   (set MAX_PAIRS / FEED_POOL / DWELL_SEC etc. in .env)
  */
 import readline from 'node:readline';
 import { config, paths } from '../config.js';
@@ -38,7 +41,7 @@ function waitForStop(): Promise<void> {
 const hhmm = (s: number) => new Date(s * 1000).toISOString().slice(11, 19);
 const DOT = { green: '🟢', red: '🔴', doji: '⚪' } as const;
 
-interface FeedStatus { conns: number; live: number; authReady: boolean }
+interface FeedStatus { conns: number; live: number; authReady: boolean; paused: boolean; pinned: string[]; watchlist: number }
 
 async function main() {
   const builder = new CandleBuilder(config.timeframeSec, config.graceSec);
@@ -47,10 +50,23 @@ async function main() {
   const supabase = new SupabaseSink(config.supabase.url, config.supabase.serviceKey);
   const labels = new Map<string, string>();
   const catalog = new Map<string, { isOpen: boolean; otc: boolean; payout: number; type: string }>();
-  const liveSymbols = new Set<string>();
   const tracker = new OutcomeTracker(paths.outcomesFile);
   let alertCount = 0;
   let lastTickAt = Date.now();
+
+  // Per-symbol tick watermark: rotation revisits re-send overlapping history,
+  // so every tick at or below the watermark has already been counted.
+  const lastTs = new Map<string, number>();
+  // Wall-clock ms of the last LIVE (updateStream) tick per symbol — decides
+  // whether a symbol's candles close on the fast grace or wait for backfill.
+  const lastLiveAt = new Map<string, number>();
+
+  const ingest = (symbol: string, ts: number, price: number) => {
+    if (!Number.isFinite(ts) || !Number.isFinite(price)) return;
+    if (ts <= (lastTs.get(symbol) ?? 0)) return;
+    lastTs.set(symbol, ts);
+    for (const c of builder.addTick({ symbol, ts, price })) onClosedCandle(c);
+  };
 
   const context = await openPersistentContext({ headless: config.headless });
   await context.addInitScript(installFeed);
@@ -59,10 +75,50 @@ async function main() {
   // In-page feed calls, hardened against transient navigation/reload errors.
   const feedStatus = () =>
     page.evaluate(() => (window as unknown as { __feedStatus?: () => FeedStatus }).__feedStatus?.()).catch(() => undefined);
-  const feedAdd = (syms: string[]) =>
-    page.evaluate((s) => (window as unknown as { __feedAdd?: (x: string[]) => number }).__feedAdd?.(s) ?? 0, syms).catch(() => 0);
-  const feedRemove = (syms: string[]) =>
-    page.evaluate((s) => (window as unknown as { __feedRemove?: (x: string[]) => number }).__feedRemove?.(s) ?? 0, syms).catch(() => 0);
+  const feedStart = (syms: string[]) =>
+    page.evaluate(
+      ({ s, pool, dwell }) => (window as unknown as { __feedStart?: (x: string[], p: number, d: number) => number }).__feedStart?.(s, pool, dwell) ?? 0,
+      { s: syms, pool: config.feedPool, dwell: config.dwellSec },
+    ).catch(() => 0);
+  const feedSetWatchlist = (syms: string[]) =>
+    page.evaluate((s) => (window as unknown as { __feedSetWatchlist?: (x: string[]) => number }).__feedSetWatchlist?.(s) ?? 0, syms).catch(() => 0);
+  const feedPin = (sym: string) =>
+    page.evaluate((s) => (window as unknown as { __feedPin?: (x: string) => boolean }).__feedPin?.(s) ?? false, sym).catch(() => false);
+  const feedUnpin = (sym: string) =>
+    page.evaluate((s) => (window as unknown as { __feedUnpin?: (x: string) => boolean }).__feedUnpin?.(s) ?? false, sym).catch(() => false);
+
+  // ── Pin driver: hot pairs (streak within pinMargin of threshold) get a
+  // dedicated live socket so the alerting candle streams in real time. ──
+  const PIN_MARGIN = config.pinMargin;
+  const maxPins = Math.max(1, config.feedPool - 2); // always keep ≥2 rotating
+  // Alert freshness ceiling — recomputed from the real sweep once the
+  // watchlist is known (a backfill-detected alert is at most one sweep old).
+  let alertFreshnessSec = 150;
+  const pinned = new Set<string>();
+  const countOf = (sym: string) => {
+    const st = engine.peek(sym);
+    return st?.colour ? st.count : 0;
+  };
+  const updatePin = (symbol: string) => {
+    const hot = countOf(symbol) >= config.streakThreshold - PIN_MARGIN;
+    if (hot && !pinned.has(symbol)) {
+      if (pinned.size >= maxPins) {
+        // Evict the coolest pin only if this candidate is strictly hotter.
+        let coolest: string | undefined;
+        for (const p of pinned) if (coolest === undefined || countOf(p) < countOf(coolest)) coolest = p;
+        if (coolest === undefined || countOf(coolest) >= countOf(symbol)) return;
+        pinned.delete(coolest);
+        void feedUnpin(coolest);
+        console.log(`  [pin] ${coolest.replace(/_otc$/, '')} evicted for hotter ${symbol.replace(/_otc$/, '')}`);
+      }
+      pinned.add(symbol);
+      void feedPin(symbol);
+      console.log(`  [pin] ${symbol.replace(/_otc$/, '')} at ${countOf(symbol)} — live socket until streak breaks`);
+    } else if (!hot && pinned.has(symbol)) {
+      pinned.delete(symbol);
+      void feedUnpin(symbol);
+    }
+  };
 
   const onClosedCandle = (candle: Candle) => {
     // Settle any pending alert outcome BEFORE the engine can register a new one.
@@ -72,9 +128,13 @@ async function main() {
       supabase.outcome(outcome);
     }
 
-    const seeded = !liveSymbols.has(candle.symbol);
+    // Freshness gate: candles older than one sweep (+margin) are seeded
+    // history (startup backfill) — track their streak state but never alert
+    // on them. A normal sweep-revisit candle is at most one sweep old.
+    const closedAgoSec = Date.now() / 1000 - (candle.periodStart + candle.timeframeSec);
     const alert = engine.onCandle(candle);
-    if (alert && !seeded) {
+    updatePin(candle.symbol);
+    if (alert && closedAgoSec <= alertFreshnessSec) {
       // Payouts drift during the session; suppress alerts for pairs that have
       // slipped below the floor since the watchlist was built.
       const meta = catalog.get(alert.symbol);
@@ -113,7 +173,8 @@ async function main() {
     if (frame.event === 'updateHistoryNewFast') {
       const p = frame.args?.[0] as { asset?: string; history?: [number, number][] } | undefined;
       if (p?.asset && Array.isArray(p.history)) {
-        for (const [ts, price] of p.history) for (const c of builder.addTick({ symbol: p.asset, ts, price })) onClosedCandle(c);
+        lastTickAt = Date.now(); // backfill counts as feed activity
+        for (const [ts, price] of p.history) ingest(p.asset, ts, price);
       }
       return;
     }
@@ -122,8 +183,8 @@ async function main() {
         if (Array.isArray(t) && typeof t[0] === 'string') {
           const tick: Tick = { symbol: t[0], ts: Number(t[1]), price: Number(t[2]) };
           lastTickAt = Date.now();
-          liveSymbols.add(tick.symbol);
-          for (const c of builder.addTick(tick)) onClosedCandle(c);
+          lastLiveAt.set(tick.symbol, Date.now());
+          ingest(tick.symbol, tick.ts, tick.price);
         }
       }
     }
@@ -175,21 +236,41 @@ async function main() {
   }
   const classSummary = [...byClass.entries()].map(([t, n]) => `${t} ${n}`).join(', ');
 
+  const sweepSec = () => Math.ceil(watchlist.length / config.feedPool) * config.dwellSec;
+
   console.log('\n─────────────────────────────────────────────────────');
-  console.log('  PHASE 3 — MULTI-PAIR SCAN');
+  console.log('  PHASE 3 — MULTI-PAIR SCAN (rotating pool)');
   console.log(`  • Threshold: ${config.streakThreshold} | timeframe: ${config.timeframeSec}s | doji: ${config.breakOnDoji ? 'break' : 'ignore'}`);
   console.log(`  • Payout floor: ${config.minPayout}%`);
   console.log(`  • Watchlist: ${watchlist.length} pairs (catalog ${catalog.size}, cap ${config.maxPairs}) — ${classSummary || 'n/a'}`);
+  console.log(`  • Pool: ${config.feedPool} sockets | dwell ${config.dwellSec}s | full sweep ≈ ${sweepSec()}s`);
   console.log(`  • Telegram: ${telegram.isEnabled ? 'ENABLED' : 'disabled (console only)'}`);
   console.log(`  • Supabase: ${supabase.isEnabled ? 'ENABLED' : 'disabled (local log only)'}`);
   console.log('  • Press ENTER (or send SIGTERM) to stop.');
   console.log('─────────────────────────────────────────────────────\n');
 
-  const opened = await feedAdd(watchlist);
-  console.log(`  Opening ${opened} connections (staggered)…`);
+  // Pinning at threshold−N needs every pair visited at least once per N
+  // candles, or a streak could hit the threshold before we notice it's hot.
+  if (sweepSec() > config.timeframeSec * PIN_MARGIN - 10) {
+    console.warn(`  ⚠ Sweep (${sweepSec()}s) exceeds ${PIN_MARGIN} candles — raise FEED_POOL/PIN_MARGIN or lower DWELL_SEC/MAX_PAIRS to guarantee real-time alerts.`);
+  }
+  alertFreshnessSec = Math.max(150, sweepSec() + 60);
 
+  const started = await feedStart(watchlist);
+  console.log(`  Rotating ${started} pairs over ${config.feedPool} sockets…`);
+  // Pins requested before the pool existed (candles close during the catalog
+  // wait, off PO's own chart stream) were recorded node-side only — re-assert.
+  for (const s of pinned) void feedPin(s);
+
+  // Live pairs close on the normal grace; rotated pairs wait for the next
+  // visit's backfill to complete the candle (data-driven close). The long
+  // grace is only a safety net for pairs the rotation failed to revisit.
+  const graceFor = (symbol: string) => {
+    const liveRecently = Date.now() - (lastLiveAt.get(symbol) ?? 0) < 8_000;
+    return liveRecently ? config.graceSec : Math.max(150, sweepSec() * 2 + 30);
+  };
   const flusher = setInterval(() => {
-    for (const c of builder.flush(Date.now() / 1000)) onClosedCandle(c);
+    for (const c of builder.flush(Date.now() / 1000, graceFor)) onClosedCandle(c);
   }, 1000);
 
   const status = setInterval(async () => {
@@ -200,13 +281,15 @@ async function main() {
       .sort((a, b) => (b.p!.count) - (a.p!.count))
       .slice(0, 6)
       .map((x) => `${x.s.replace(/_otc$/, '')} ${x.p!.count}${x.p!.colour === 'red' ? '🔴' : '🟢'}`);
-    console.log(`  [status] conns ${st?.live ?? '?'}/${st?.conns ?? '?'} live | candles for ${liveSymbols.size} pairs | alerts ${alertCount} | top: ${active.join('  ') || '—'}`);
+    const pins = st?.pinned?.length ? ` | 📌 ${st.pinned.map((p) => p.replace(/_otc$/, '')).join(',')}` : '';
+    console.log(`  [status] conns ${st?.live ?? '?'}/${st?.conns ?? '?'} live${st?.paused ? ' | ⏸ breaker: reconnects paused' : ''}${pins} | tracking ${lastTs.size} pairs | alerts ${alertCount} | top: ${active.join('  ') || '—'}`);
   }, 15_000);
 
   // ── Watchdog (#4): a silent feed is never ambiguous — warn, then self-heal. ──
   let feedStale = false;
   let recovering = false;
   let lastRecoveryAt = 0;
+  let recoveryDelayMs = 90_000;
   const watchdog = setInterval(async () => {
     const silentSec = (Date.now() - lastTickAt) / 1000;
     if (!feedStale && silentSec > config.staleFeedSec) {
@@ -216,13 +299,17 @@ async function main() {
       void telegram.send(msg);
     } else if (feedStale && silentSec < config.staleFeedSec) {
       feedStale = false;
+      recoveryDelayMs = 90_000; // healthy again → next incident starts fresh
       const msg = '✅ PocketVision: feed recovered — ticks are flowing again.';
       console.log(`\n  ${msg}\n`);
       void telegram.send(msg);
     }
-    if (feedStale && !recovering && Date.now() - lastRecoveryAt > 90_000) {
+    if (feedStale && !recovering && Date.now() - lastRecoveryAt > recoveryDelayMs) {
       recovering = true;
       lastRecoveryAt = Date.now();
+      // Each reload+reopen is itself a ~30-connection burst; repeating it
+      // every 90s during a server-side throttle extends the punishment.
+      recoveryDelayMs = Math.min(recoveryDelayMs * 2, 900_000);
       try {
         console.log('  [watchdog] reloading terminal + reopening connections…');
         await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
@@ -232,8 +319,11 @@ async function main() {
           if ((await feedStatus())?.authReady) break;
           await page.waitForTimeout(1000);
         }
-        const reopened = await feedAdd(watchlist);
-        console.log(`  [watchdog] reopened ${reopened} connections`);
+        // The reload wiped the in-page manager (init script re-ran fresh), so
+        // restart the pool; node-side pins re-assert as candles close.
+        pinned.clear();
+        const reopened = await feedStart(watchlist);
+        console.log(`  [watchdog] restarted pool for ${reopened} pairs (next attempt in ${Math.round(recoveryDelayMs / 60_000)}m if still silent)`);
       } finally {
         recovering = false;
       }
@@ -260,9 +350,10 @@ async function main() {
         const toAdd = desired.filter((s) => !current.has(s));
         const toRemove = watchlist.filter((s) => !wanted.has(s));
         if (toAdd.length === 0 && toRemove.length === 0) return;
-        await feedRemove(toRemove);
-        await feedAdd(toAdd);
+        await feedSetWatchlist(desired);
+        for (const s of toRemove) pinned.delete(s); // in-page pins already cleared
         watchlist = desired;
+        alertFreshnessSec = Math.max(150, sweepSec() + 60);
         const fmt = (l: string[]) => l.slice(0, 6).join(', ') + (l.length > 6 ? ', …' : '');
         console.log(`  [watchlist] refreshed → ${watchlist.length} pairs${toAdd.length ? ` | +${toAdd.length}: ${fmt(toAdd)}` : ''}${toRemove.length ? ` | −${toRemove.length}: ${fmt(toRemove)}` : ''}`);
       }, config.watchlistRefreshMin * 60_000)
