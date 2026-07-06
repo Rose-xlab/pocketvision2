@@ -5,7 +5,9 @@
 import { CandleBuilder, type Candle } from './candles.js';
 import { StreakEngine, type StreakAlert } from './streaks.js';
 import { OutcomeTracker, type OutcomeRecord } from './outcomes.js';
-import { classifyAsset, edgeStats, rideAt, wilson, EdgeBook } from './edge.js';
+import { classifyAsset, edgeStats, rideAt, wilson, splitHoldout, EdgeBook, ROLLING_MIN_N } from './edge.js';
+import { kellyFraction, RiskManager } from '../risk/manager.js';
+import { FundingHarvester, type FundingRate } from '../strategies/funding.js';
 
 let failures = 0;
 function assert(cond: boolean, msg: string): void {
@@ -230,6 +232,140 @@ console.log('\nEdge maths');
   book.add({ outcome: 'reversal', label: 'EUR/USD OTC', payout: 92 } as OutcomeRecord);
   const st = book.rideStats('forex');
   assert(st.n === 4 && st.wins === 3, `EdgeBook tallies per class: ${st.wins}/${st.n}`);
+}
+
+// ── Realistic entry (entryReal at alert + delay, rideReal scoring) ──
+console.log('\nRealistic entry');
+{
+  const mkC = (i: number, open: number, close: number): Candle =>
+    ({ symbol: 'X', periodStart: i * 60, timeframeSec: 60, open, high: Math.max(open, close) + 0.1, low: Math.min(open, close) - 0.1, close, ticks: 5 });
+  const finals: OutcomeRecord[] = [];
+  const t = new OutcomeTracker(undefined, (r) => finals.push(r), 10);
+
+  // Alert on candle 6 (green). Entry candle = [420, 480).
+  t.register(alertFrom(mkC(6, 1.8, 2.0), 'green'));
+  t.onTick('X', 425, 2.05);            // only 5s in — too early
+  t.onTick('X', 431, 2.10);            // 11s in → entryReal = 2.10
+  t.onTick('X', 440, 2.20);            // already captured, must not overwrite
+  t.onCandle(mkC(7, 2.0, 2.15));       // expiry 1: ideal entry 2.0 → win; real 2.10 → win
+  t.onCandle(mkC(8, 2.15, 2.05));      // expiry 2: ideal win (2.05 > 2.0), real LOSS (2.05 < 2.10)
+  t.onCandle(mkC(9, 2.05, 2.10));      // expiry 3: ideal win, real flat (2.10 == 2.10)
+  assert(finals.length === 1, 'record finalizes with realistic entry attached');
+  assert(finals[0]?.entryReal === 2.10, `entryReal = first tick ≥ delay (got ${finals[0]?.entryReal})`);
+  assert(JSON.stringify(finals[0]?.ride) === '["win","win","win"]', `ideal ride all wins: ${JSON.stringify(finals[0]?.ride)}`);
+  assert(JSON.stringify(finals[0]?.rideReal) === '["win","loss","flat"]', `realistic ride shows the slippage cost: ${JSON.stringify(finals[0]?.rideReal)}`);
+
+  // Tick after the entry candle ends must NOT become entryReal.
+  const t2 = new OutcomeTracker(undefined, (r) => finals.push(r), 10);
+  t2.register(alertFrom(mkC(6, 1.8, 2.0), 'green'));
+  t2.onTick('X', 485, 9.99); // entry candle already over
+  t2.onCandle(mkC(7, 2.0, 2.15));
+  t2.onCandle(mkC(8, 2.15, 2.2));
+  t2.onCandle(mkC(9, 2.2, 2.3));
+  assert(finals[1]?.entryReal === undefined, 'tick after the entry candle is not a realistic entry');
+}
+
+// ── Decay monitor (rolling window demotes a dying edge) ──
+console.log('\nDecay monitor');
+{
+  const rec = (win: boolean): OutcomeRecord =>
+    ({ outcome: win ? 'continuation' : 'reversal', assetType: 'currency', payout: 92 } as OutcomeRecord);
+  const book = new EdgeBook();
+  // 260 strong wins: all-time GRADUATED (75%+ win rate).
+  for (let i = 0; i < 260; i++) book.add(rec(i % 4 !== 0)); // 75% win
+  assert(book.rideStats('forex').status === 'GRADUATED', 'strong history graduates');
+  assert(book.decayAlarm('forex') === null, 'healthy edge raises no alarm');
+
+  // Then the edge dies: 100 straight results at 30% win.
+  let alarm: string | null = null;
+  for (let i = 0; i < 100; i++) {
+    book.add(rec(i % 10 < 3));
+    alarm = alarm ?? book.decayAlarm('forex');
+  }
+  const s = book.rideStats('forex');
+  assert(s.decayed === true, 'rolling window below break-even flags decay');
+  assert(s.status === 'candidate', 'GRADUATED auto-demotes to candidate (paper)');
+  assert(alarm !== null && alarm.includes('EDGE DECAY'), 'one-shot decay alarm fires on the transition');
+  assert(book.decayAlarm('forex') === null, 'alarm does not repeat while still decayed');
+
+  // Small samples never flag decay.
+  const young = new EdgeBook();
+  for (let i = 0; i < ROLLING_MIN_N - 1; i++) young.add(rec(false));
+  assert(young.rideStats('forex').decayed !== true, 'decay needs a minimum rolling sample');
+}
+
+// ── Holdout split ──
+console.log('\nHoldout split');
+{
+  const recs = Array.from({ length: 10 }, (_, i) =>
+    ({ at: `2026-07-0${Math.min(9, i + 1)}T0${i % 10}:00:00Z`, symbol: 'S', alertPeriodStart: i } as OutcomeRecord));
+  const [a, b] = splitHoldout(recs);
+  assert(a.length === 5 && b.length === 5, 'splits into equal chronological halves');
+  assert(a.every((r) => r.at <= b[0]!.at), 'first half is strictly earlier');
+}
+
+// ── Risk manager (Kelly, gates, stops, kill switch) ──
+console.log('\nRisk manager');
+{
+  assert(Math.abs(kellyFraction(0.55, 0.92) - (0.55 * 1.92 - 1) / 0.92) < 1e-12, 'Kelly formula for binary payout');
+  assert(kellyFraction(0.5, 0.92) === 0, 'no edge → zero Kelly');
+
+  const cfg = { bankroll: 1000, kellyFraction: 0.25, maxStakePct: 2, dailyStopPct: 5, maxDrawdownPct: 20 };
+  const graduated = edgeStats(150, 50, 200 * 92); // 75%, CI floor ~68% → GRADUATED
+  const candidate = edgeStats(60, 40, 100 * 92);
+
+  const rm = new RiskManager(cfg);
+  const d = rm.stakeFor('po-ride-forex', graduated);
+  assert(d.allowed && d.stake > 0, `graduated bucket gets a stake (${d.stakePct}% = ${d.stake})`);
+  assert(d.stakePct <= 2, 'hard cap: never above maxStakePct');
+  assert(!rm.stakeFor('x', candidate).allowed, 'candidate bucket gets NO stake');
+  assert(!rm.stakeFor('x', { ...graduated, decayed: true }).allowed, 'decayed bucket gets NO stake');
+
+  // Daily stop: lose 5% of bankroll → no more stakes today.
+  rm.recordResult('po-ride-forex', -50);
+  assert(!rm.stakeFor('po-ride-forex', graduated).allowed, 'daily stop blocks after -5% day');
+
+  // Kill switch: drawdown ≥ 20% of bankroll → everything blocked until reset.
+  const rm2 = new RiskManager(cfg);
+  rm2.recordResult('s', +100);          // peak 100
+  rm2.recordResult('s', -300);          // drawdown 300 ≥ 200 → killed
+  assert(rm2.status().killed, 'kill switch trips at max drawdown from peak');
+  assert(!rm2.stakeFor('s', graduated).allowed, 'killed manager refuses all stakes');
+  rm2.resetKill();
+  assert(rm2.status().killed === false, 'manual resetKill() re-arms (deliberate human act)');
+}
+
+// ── Funding harvester (paper simulator) ──
+console.log('\nFunding harvester');
+{
+  const cfg = { enterApr: 15, exitApr: 5, feeRoundTripPct: 0.2, maxPositions: 2, notional: 1000 };
+  const h = new FundingHarvester(cfg);
+  const r = (symbol: string, apr: number, source: 'binance' | 'bybit' = 'binance'): FundingRate =>
+    ({ source, symbol, rate8h: apr / 100 / 3 / 365, apr });
+
+  const t0 = Date.parse('2026-07-06T00:00:00Z');
+  const opened = h.step([r('AAAUSDT', 30), r('BBBUSDT', 20), r('CCCUSDT', 18), r('DDDUSDT', 3)], t0);
+  assert(opened.filter((e) => e.type === 'open').length === 2, 'opens best candidates up to maxPositions');
+  assert(h.positions.has('binance:AAAUSDT') && h.positions.has('binance:BBBUSDT'), 'highest APR first');
+
+  // Same coin on a second venue must not double up.
+  const h2 = new FundingHarvester(cfg);
+  h2.step([r('AAAUSDT', 30, 'binance'), r('AAAUSDT', 28, 'bybit')], t0);
+  assert(h2.positions.size === 1, 'one position per base asset across venues');
+
+  // 8 hours later at 30% APR: accrual ≈ notional × rate8h.
+  const t1 = t0 + 8 * 3600 * 1000;
+  h.step([r('AAAUSDT', 30), r('BBBUSDT', 20)], t1);
+  const accrued = h.positions.get('binance:AAAUSDT')!.accrued;
+  const expected = 1000 * (30 / 100 / 3 / 365);
+  assert(Math.abs(accrued - expected) < 1e-9, `8h accrual ≈ ${expected.toFixed(4)} (got ${accrued.toFixed(4)})`);
+
+  // Rate decays below exit → close, fees charged.
+  const events = h.step([r('AAAUSDT', 2), r('BBBUSDT', 20)], t1 + 1000);
+  const close = events.find((e) => e.type === 'close');
+  assert(close?.type === 'close' && close.symbol === 'AAAUSDT', 'decayed position closes');
+  assert(close?.type === 'close' && Math.abs(close.fees - 2) < 1e-9, 'round-trip fee charged (0.2% of 1000)');
+  assert(close?.type === 'close' && close.realized < close.accrued, 'realized = accrued − fees');
 }
 
 console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILED ✗`}`);

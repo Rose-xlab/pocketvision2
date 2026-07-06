@@ -52,6 +52,11 @@ export interface EdgeStats {
   /** EV at the CI lower bound — the pessimistic-but-plausible case. */
   evLo: number;
   status: 'GRADUATED' | 'candidate' | 'negative' | 'insufficient';
+  /** True when the rolling window has dropped below break-even while the
+   *  all-time stats still look fine — edge is dying, GRADUATED is demoted. */
+  decayed?: boolean;
+  /** Rolling last-`ROLLING_WINDOW` view behind the decay verdict. */
+  rolling?: { n: number; winRate: number; breakEven: number };
 }
 
 /** Sample size before a positive EV can graduate to real-money status. */
@@ -86,6 +91,17 @@ export function rideAt(rec: OutcomeRecord, i: number): RideOutcome | undefined {
   }
 }
 
+/**
+ * Holdout split — the multiple-comparisons killer. Chronological halves:
+ * a bucket found by scanning many slices will look good on the whole sample
+ * by luck alone; a REAL edge is positive in the first half AND the second.
+ */
+export function splitHoldout(records: OutcomeRecord[]): [OutcomeRecord[], OutcomeRecord[]] {
+  const sorted = [...records].sort((a, b) => a.at.localeCompare(b.at));
+  const mid = Math.floor(sorted.length / 2);
+  return [sorted.slice(0, mid), sorted.slice(mid)];
+}
+
 export function loadOutcomes(file: string): OutcomeRecord[] {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf8')
@@ -95,16 +111,37 @@ export function loadOutcomes(file: string): OutcomeRecord[] {
     .filter((r): r is OutcomeRecord => r !== null);
 }
 
-interface Bucket { wins: number; losses: number; payoutSum: number }
-const newBucket = (): Bucket => ({ wins: 0, losses: 0, payoutSum: 0 });
+/** Rolling decay window: the last N decided trades per class. */
+export const ROLLING_WINDOW = 100;
+/** Minimum rolling sample before a decay verdict is meaningful. */
+export const ROLLING_MIN_N = 40;
+
+interface Bucket {
+  wins: number;
+  losses: number;
+  payoutSum: number;
+  /** Last `ROLLING_WINDOW` decided results, oldest first. */
+  recent: { win: boolean; payout: number }[];
+}
+const newBucket = (): Bucket => ({ wins: 0, losses: 0, payoutSum: 0, recent: [] });
 
 /**
  * Live per-asset-class ride edge, kept current as outcomes resolve.
  * The scanner uses it to stamp every alert with the measured edge for that
  * setup — the alert carries its own evidence.
+ *
+ * Decay monitor: alongside the all-time tally, each class keeps a rolling
+ * window of its last `ROLLING_WINDOW` decided trades. If the rolling win rate
+ * falls below the rolling break-even while the all-time stats still say
+ * GRADUATED/candidate, the edge is treated as DECAYED: `rideStats` demotes
+ * GRADUATED → candidate (paper) automatically, and `decayAlarm` returns a
+ * one-shot message on each ok→decayed / decayed→ok transition so the scanner
+ * can notify Telegram without spamming it.
  */
 export class EdgeBook {
   private readonly byClass = new Map<AssetClass, Bucket>();
+  /** Last decay state per class, for transition-only alarms. */
+  private readonly alarmState = new Map<AssetClass, boolean>();
 
   constructor(file?: string) {
     if (file) for (const rec of loadOutcomes(file)) this.add(rec);
@@ -118,11 +155,56 @@ export class EdgeBook {
     const b = this.byClass.get(cls) ?? newBucket();
     if (r1 === 'win') b.wins++; else b.losses++;
     b.payoutSum += rec.payout ?? 92;
+    b.recent.push({ win: r1 === 'win', payout: rec.payout ?? 92 });
+    if (b.recent.length > ROLLING_WINDOW) b.recent.shift();
     this.byClass.set(cls, b);
   }
 
+  /** Rolling-window stats only (the decay monitor's view). */
+  rollingStats(cls: AssetClass): EdgeStats {
+    const b = this.byClass.get(cls) ?? newBucket();
+    const wins = b.recent.filter((r) => r.win).length;
+    const losses = b.recent.length - wins;
+    return edgeStats(wins, losses, b.recent.reduce((s, r) => s + r.payout, 0));
+  }
+
+  /** True when the recent window is losing while all-time still looks fine. */
+  isDecayed(cls: AssetClass): boolean {
+    const b = this.byClass.get(cls) ?? newBucket();
+    if (b.recent.length < ROLLING_MIN_N) return false;
+    const all = edgeStats(b.wins, b.losses, b.payoutSum);
+    if (all.status !== 'GRADUATED' && all.status !== 'candidate') return false; // nothing to protect
+    const roll = this.rollingStats(cls);
+    return roll.winRate < roll.breakEven;
+  }
+
+  /** All-time stats with the decay demotion applied (GRADUATED → candidate). */
   rideStats(cls: AssetClass): EdgeStats {
     const b = this.byClass.get(cls) ?? newBucket();
-    return edgeStats(b.wins, b.losses, b.payoutSum);
+    const s = edgeStats(b.wins, b.losses, b.payoutSum);
+    const roll = this.rollingStats(cls);
+    s.rolling = { n: roll.n, winRate: roll.winRate, breakEven: roll.breakEven };
+    if (this.isDecayed(cls)) {
+      s.decayed = true;
+      if (s.status === 'GRADUATED') s.status = 'candidate'; // back to paper
+    }
+    return s;
+  }
+
+  /**
+   * One-shot transition alarm. Call after every `add`; returns a message the
+   * first time a class flips ok→decayed (or recovers), null otherwise.
+   */
+  decayAlarm(cls: AssetClass): string | null {
+    const now = this.isDecayed(cls);
+    const before = this.alarmState.get(cls) ?? false;
+    if (now === before) return null;
+    this.alarmState.set(cls, now);
+    const roll = this.rollingStats(cls);
+    const pf = (x: number) => `${(x * 100).toFixed(1)}%`;
+    return now
+      ? `🚨 EDGE DECAY: ${cls} ride — rolling last ${roll.n} trades at ${pf(roll.winRate)} win, below break-even ${pf(roll.breakEven)}. ` +
+        `Auto-demoted to PAPER ONLY until the rolling window recovers.`
+      : `✅ EDGE RECOVERED: ${cls} ride — rolling window back above break-even (${pf(roll.winRate)} on last ${roll.n}).`;
   }
 }

@@ -61,6 +61,31 @@ accept the copied session — or it may demand a fresh login. If the log says
 3. `Start-ScheduledTask -TaskName PocketVision` — from then on the session
    renews itself with daily use.
 
+## Upgrading to the money engine (2026-07-06 build)
+
+The build adds holdout/decay validation, the risk manager, the PO timestamp
+fix, and two new **paper** streams (crypto scan + funding harvester — public
+data, no keys, no browser). To upgrade a VPS that already runs PocketVision:
+
+On your PC: stop the local scanner, then `deploy\make-bundle.ps1`, copy the
+zip over RDP as usual. On the VPS (PowerShell as Administrator):
+
+```powershell
+cd C:\pocketvision
+Stop-ScheduledTask -TaskName PocketVision
+Get-Process node, chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+# Extract the new zip over C:\pocketvision (replace all). Keep the VPS's own
+# .auth if its session is newer than the bundled one.
+npm run migrate:tz          # one-time: shifts old outcome records to true UTC
+powershell -ExecutionPolicy Bypass -File deploy\vps-add-streams.ps1
+Start-ScheduledTask -TaskName PocketVision
+Start-ScheduledTask -TaskName PocketVisionCrypto
+Start-ScheduledTask -TaskName PocketVisionFunding
+```
+
+Then stop any copies still running on your PC — two scanners on one Telegram
+chat means every alert arrives twice.
+
 ## Day-to-day
 
 | What | How |

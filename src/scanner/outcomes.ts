@@ -33,6 +33,13 @@ import { colourOf, type StreakAlert } from './streaks.js';
 export const EXPIRIES = 3;
 /** Give rotation/backfill this long to deliver the post-alert candles. */
 const FINALIZE_TIMEOUT_SEC = 15 * 60;
+/**
+ * Realistic-entry delay: a human reading a Telegram alert (or a delayed
+ * executor) enters ~this many seconds AFTER the entry candle opens. We record
+ * the first tick at/after that moment as `entryReal`, so the report can show
+ * the edge at the entry you actually get — not just the ideal next-open.
+ */
+export const REAL_ENTRY_DELAY_SEC = 10;
 
 export type RideOutcome = 'win' | 'loss' | 'flat' | 'void';
 
@@ -57,6 +64,13 @@ export interface OutcomeRecord {
   lastRange?: number;
   /** Simulated strike: open of the first post-alert candle. */
   entry?: number;
+  /** Realistic strike: first tick ≥ `entryRealDelaySec` into the entry candle
+   *  (what a human/delayed executor actually gets). Absent when no live tick
+   *  arrived inside the entry candle (rotated/backfilled pairs). */
+  entryReal?: number;
+  entryRealDelaySec?: number;
+  /** RIDE result at expiry 1..3 scored against `entryReal` instead of `entry`. */
+  rideReal?: RideOutcome[];
   /** Legacy 1-candle result (next candle's colour vs. the streak). */
   outcome: 'reversal' | 'continuation' | 'doji' | 'void';
   /** The candle that resolved expiry 1 (absent for void). */
@@ -75,6 +89,8 @@ interface Pending {
   /** Next expiry to resolve (1-based). */
   expiry: number;
   entry?: number;
+  /** First tick price at/after the realistic-entry moment (see onTick). */
+  entryReal?: number;
   ride: RideOutcome[];
   nexts: (NextCandle | null)[];
   record?: OutcomeRecord;
@@ -91,8 +107,26 @@ export class OutcomeTracker {
   constructor(
     private readonly file?: string,
     private readonly onFinal?: (rec: OutcomeRecord) => void,
+    private readonly realEntryDelaySec = REAL_ENTRY_DELAY_SEC,
   ) {
     if (file) fs.mkdirSync(path.dirname(file), { recursive: true });
+  }
+
+  /**
+   * Feed raw ticks (live stream only is fine). Captures `entryReal` — the
+   * first tick at/after `realEntryDelaySec` into the entry candle — for every
+   * pending alert on that symbol. Ticks after the entry candle ends are
+   * ignored: a 1-minute trade entered a minute late is a different trade.
+   */
+  onTick(symbol: string, ts: number, price: number): void {
+    const list = this.pending.get(symbol);
+    if (!list) return;
+    for (const p of list) {
+      if (p.entryReal !== undefined) continue;
+      const tf = p.alert.candle.timeframeSec;
+      const entryOpen = p.alert.candle.periodStart + tf;
+      if (ts >= entryOpen + this.realEntryDelaySec && ts < entryOpen + tf) p.entryReal = price;
+    }
   }
 
   /** Call when an alert is actually sent. */
@@ -223,6 +257,18 @@ export class OutcomeTracker {
     if (!rec) return;
     rec.ride = p.ride;
     rec.nexts = p.nexts;
+    // Score the realistic entry against the same post-alert closes, so the
+    // report can put the ideal and achievable edges side by side.
+    if (p.entryReal !== undefined) {
+      rec.entryReal = p.entryReal;
+      rec.entryRealDelaySec = this.realEntryDelaySec;
+      const dir = p.alert.colour;
+      rec.rideReal = p.nexts.map((nc): RideOutcome => {
+        if (!nc) return 'void';
+        if (nc.close === p.entryReal) return 'flat';
+        return (dir === 'green' ? nc.close > p.entryReal! : nc.close < p.entryReal!) ? 'win' : 'loss';
+      });
+    }
     if (this.file) fs.appendFileSync(this.file, `${JSON.stringify(rec)}\n`);
     this.onFinal?.(rec);
   }

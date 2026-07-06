@@ -15,8 +15,11 @@
     "analyze": "tsx src/phase1/analyze.ts",
     "scan:one": "tsx src/scanner/live-single.ts",
     "scan": "tsx src/scanner/scan-all.ts",
+    "scan:crypto": "tsx src/scanner/scan-crypto.ts",
+    "funding": "tsx src/strategies/funding-run.ts",
     "test:telegram": "tsx src/tools/telegram-test.ts",
     "report": "tsx src/tools/report.ts",
+    "migrate:tz": "tsx src/tools/migrate-tz.ts",
     "test:core": "tsx src/scanner/selftest.ts",
     "typecheck": "tsc --noEmit"
   },

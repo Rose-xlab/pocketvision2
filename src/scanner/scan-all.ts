@@ -22,6 +22,7 @@ import { SupabaseSink } from '../lib/supabase.js';
 import { installFeed } from './feed-inject.js';
 import { OutcomeTracker, type OutcomeRecord } from './outcomes.js';
 import { EdgeBook, classifyAsset } from './edge.js';
+import { RiskManager } from '../risk/manager.js';
 
 /**
  * Resolves on ENTER (interactive) or SIGINT/SIGTERM (Ctrl+C, systemd stop).
@@ -51,10 +52,14 @@ async function main() {
   const supabase = new SupabaseSink(config.supabase.url, config.supabase.serviceKey);
   const labels = new Map<string, string>();
   const catalog = new Map<string, { isOpen: boolean; otc: boolean; payout: number; type: string }>();
-  const tracker = new OutcomeTracker(paths.outcomesFile);
+  const tracker = new OutcomeTracker(paths.outcomesFile, undefined, config.realEntryDelaySec);
   // Seed the edge book from the full outcome history, then keep it current —
   // every alert is stamped with the measured edge for its asset class.
   const edgeBook = new EdgeBook(paths.outcomesFile);
+  // Risk manager: the bot still never places PO trades itself — but every
+  // GRADUATED alert now carries the exact stake the maths allows, and the
+  // decay/kill logic stops advising size the moment the edge stops being real.
+  const risk = new RiskManager(config.risk, paths.riskStateFile);
   let alertCount = 0;
   let lastTickAt = Date.now();
 
@@ -63,7 +68,14 @@ async function main() {
     const s = edgeBook.rideStats(cls);
     const pf = (x: number) => `${(x * 100).toFixed(1)}%`;
     const stats = `${cls} ride: ${pf(s.winRate)} win (n=${s.n}, CI ${pf(s.ci[0])}–${pf(s.ci[1])}), EV ${s.ev >= 0 ? '+' : ''}${pf(s.ev)}`;
-    if (s.status === 'GRADUATED') return { action: 'RIDE', note: `${stats} — VALIDATED ✅` };
+    if (s.decayed) return { action: 'OBSERVE', note: `${stats} — ⚠️ DECAYED (rolling window below break-even), demoted to paper` };
+    if (s.status === 'GRADUATED') {
+      const d = risk.stakeFor(`po-ride-${cls}`, s);
+      const sizing = d.allowed
+        ? `Stake: ${d.stakePct}% of bankroll${d.stake > 0 ? ` = ${d.stake}` : ''} (${d.reason})`
+        : `NO STAKE — ${d.reason}`;
+      return { action: 'RIDE', note: `${stats} — VALIDATED ✅ | ${sizing}` };
+    }
     if (s.status === 'candidate') return { action: 'RIDE', note: `${stats} — PAPER ONLY (not yet validated)` };
     if (s.status === 'insufficient') return { action: 'OBSERVE', note: `${stats} — not enough data yet` };
     return { action: 'OBSERVE', note: `no positive edge measured — ${stats}` };
@@ -74,6 +86,9 @@ async function main() {
     console.log(`  📊 ${o.symbol}: ${verdict} after ${o.streak} ${o.colour} | ${tracker.summary()}`);
     supabase.outcome(o);
     edgeBook.add(o);
+    // Decay monitor: one-shot Telegram alarm on ok→decayed (and recovery).
+    const alarm = edgeBook.decayAlarm(classifyAsset(o.assetType, o.label, o.symbol));
+    if (alarm) { console.warn(`\n  ${alarm}\n`); void telegram.send(alarm); }
   };
 
   // Per-symbol tick watermark: rotation revisits re-send overlapping history,
@@ -83,11 +98,61 @@ async function main() {
   // whether a symbol's candles close on the fast grace or wait for backfill.
   const lastLiveAt = new Map<string, number>();
 
-  const ingest = (symbol: string, ts: number, price: number) => {
-    if (!Number.isFinite(ts) || !Number.isFinite(price)) return;
+  // PO feed timestamps are platform time on SOME servers (+2h observed on the
+  // VPS) and true UTC on others — normalize to true UTC at the door so
+  // candles, alerts, freshness gates and timeouts all agree with the real
+  // clock. Starts from config and self-corrects from measured live-tick skew.
+  let poOffsetSec = config.poTimeOffsetHours * 3600;
+
+  // Future-tick guard: a tick stamped >10 min ahead of the system clock means
+  // the offset config is wrong for THIS environment (PO serves +2h platform
+  // time on some servers, true UTC on others). Ingesting it would poison the
+  // per-symbol watermark for hours and let stale backfill candles fire fresh-
+  // looking alerts — drop it and say why, once.
+  let futureWarned = false;
+  const ingest = (symbol: string, rawTs: number, price: number) => {
+    if (!Number.isFinite(rawTs) || !Number.isFinite(price)) return;
+    const ts = rawTs - poOffsetSec;
+    if (ts > Date.now() / 1000 + 600) {
+      if (!futureWarned) {
+        futureWarned = true;
+        const skewH = ((rawTs - Date.now() / 1000) / 3600).toFixed(1);
+        const msg = `⚠️ PocketVision: feed ticks are ~${skewH}h ahead of the clock but PO_TIME_OFFSET_HOURS=${config.poTimeOffsetHours}. ` +
+          `Dropping future ticks. Set PO_TIME_OFFSET_HOURS=${Math.round((rawTs - Date.now() / 1000) / 3600)} in .env and restart.`;
+        console.warn(`\n  ${msg}\n`);
+        void telegram.send(msg);
+      }
+      return;
+    }
     if (ts <= (lastTs.get(symbol) ?? 0)) return;
     lastTs.set(symbol, ts);
+    // Realistic-entry capture: first tick ≥ delay into a pending alert's entry candle.
+    tracker.onTick(symbol, ts, price);
     for (const c of builder.addTick({ symbol, ts, price })) onClosedCandle(c);
+  };
+
+  // Self-correction: live ticks are created "now", so their raw skew vs the
+  // system clock IS this environment's true offset. After 30 samples, if the
+  // median disagrees with the configured value by more than 30 min, adopt the
+  // measured offset (whole hours) for the rest of the session — the future-
+  // tick guard has been dropping the mis-stamped ticks in the meantime, so
+  // nothing was poisoned. One-shot, announced, and .env can persist it.
+  const skewSamples: number[] = [];
+  let skewHandled = false;
+  const checkSkew = (rawTs: number) => {
+    if (skewHandled) return;
+    skewSamples.push(rawTs - Date.now() / 1000);
+    if (skewSamples.length < 30) return;
+    skewHandled = true;
+    const median = [...skewSamples].sort((a, b) => a - b)[15]!;
+    if (Math.abs(median - poOffsetSec) > 1800) {
+      const hours = Math.round(median / 3600);
+      poOffsetSec = hours * 3600;
+      const msg = `🕐 PocketVision: this feed's clock is ${(median / 3600).toFixed(1)}h ahead of UTC — ` +
+        `auto-adjusted for this session. Set PO_TIME_OFFSET_HOURS=${hours} in .env to make it permanent.`;
+      console.warn(`\n  ${msg}\n`);
+      void telegram.send(msg);
+    }
   };
 
   const context = await openPersistentContext({ headless: config.headless });
@@ -202,6 +267,7 @@ async function main() {
           const tick: Tick = { symbol: t[0], ts: Number(t[1]), price: Number(t[2]) };
           lastTickAt = Date.now();
           lastLiveAt.set(tick.symbol, Date.now());
+          checkSkew(tick.ts);
           ingest(tick.symbol, tick.ts, tick.price);
         }
       }

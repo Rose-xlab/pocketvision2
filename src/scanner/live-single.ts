@@ -67,12 +67,15 @@ async function main() {
       return;
     }
 
+    // PO timestamps are platform time — normalize to true UTC (see config).
+    const poOffsetSec = config.poTimeOffsetHours * 3600;
+
     // Seed candles from tick history so we don't wait minutes for context.
     if (frame.event === 'updateHistoryNewFast') {
       const p = frame.args?.[0] as { asset?: string; history?: [number, number][] } | undefined;
       if (p?.asset && Array.isArray(p.history)) {
         for (const [ts, price] of p.history) {
-          for (const c of builder.addTick({ symbol: p.asset, ts, price })) onClosedCandle(c, !liveStarted);
+          for (const c of builder.addTick({ symbol: p.asset, ts: ts - poOffsetSec, price })) onClosedCandle(c, !liveStarted);
         }
       }
       return;
@@ -84,7 +87,7 @@ async function main() {
       for (const t of ticks) {
         if (Array.isArray(t) && typeof t[0] === 'string') {
           liveStarted = true;
-          const tick: Tick = { symbol: t[0], ts: Number(t[1]), price: Number(t[2]) };
+          const tick: Tick = { symbol: t[0], ts: Number(t[1]) - poOffsetSec, price: Number(t[2]) };
           for (const c of builder.addTick(tick)) onClosedCandle(c, false);
         }
       }

@@ -121,6 +121,18 @@ Hardening (all tunable in `.env`):
 - **Edge dashboard**: `npm run report` prints EV + Wilson 95% CI per direction × asset class,
   streak length, expiry, and hour, ending in explicit verdicts (GRADUATED / paper only /
   do not trade) — the evidence layer that decides what is ever traded with real money.
+- **Holdout validation** (multiple-comparisons killer): the report splits the outcome log
+  into chronological halves; a bucket is only VALIDATED when it's positive in BOTH — a slice
+  that only looks good on the full sample is luck from scanning many slices, and says so.
+- **Decay monitor**: each asset class keeps a rolling window of its last 100 decided trades.
+  If the rolling win rate drops below break-even while all-time still looks fine, the class is
+  auto-demoted GRADUATED → paper and a one-shot 🚨 decay alarm goes to Telegram (with a ✅
+  recovery message when the window heals). Edges are allowed to die — silently isn't.
+- **Realistic-entry logging**: every outcome also records `entryReal` — the first tick ≥
+  `REAL_ENTRY_DELAY_SEC` (default 10 s) into the entry candle — and scores `rideReal[]`
+  against it. The report shows the ideal (next-open) edge and the achievable (delayed) edge
+  side by side: if slippage eats the edge, manual trading is off the table and execution
+  must be automated.
 - **Dynamic watchlist** (`WATCHLIST_REFRESH_MIN=10`): the watchlist is rebuilt from live
   payouts/market hours during the session — pairs that drop below the floor are disconnected,
   newly eligible ones are added.
@@ -140,8 +152,41 @@ For always-on remote operation see **[docs/VPS-WINDOWS.md](docs/VPS-WINDOWS.md)*
 get crash-restart, reboot-start, watchdog recovery, and hourly heartbeats; the
 scanner shuts down cleanly on SIGTERM (drains Telegram, closes the browser).
 
+## The money engine (2026-07-06 build) — one brain, three streams
+
+The core pipeline (candles → streaks → outcomes → edge math) is venue-agnostic; PO is now
+just the first adapter feeding it. Everything below runs on the same graduation discipline:
+**paper until the CI floor is profitable AND holdout passes — then sized by the risk manager,
+never by feel.**
+
+- **Risk manager** (`src/risk/manager.ts`): the gate every real-money stake must pass.
+  Quarter-Kelly sizing computed at the CI *lower* bound (stakes start tiny, grow with
+  evidence), hard per-trade cap (`MAX_STAKE_PCT`), daily loss stop (`DAILY_STOP_PCT`),
+  and a max-drawdown kill switch (`MAX_DRAWDOWN_PCT`) that blocks ALL staking until a human
+  resets it. State persists in `logs/risk-state.json` so a restart can't forget a lost day.
+  GRADUATED PO alerts now carry their exact allowed stake; set `BANKROLL` in `.env` to get
+  absolute amounts instead of percentages. The bot still never places PO trades itself.
+
+- **Crypto streak scan, paper mode** (`npm run scan:crypto`): the same streak engine pointed
+  at Binance — top `CRYPTO_MAX_PAIRS` USDT pairs by volume over ONE WebSocket (no browser, no
+  rotation), klines arrive already closed, outcomes scored 1:1 (break-even 50%) into
+  `logs/outcomes-crypto.jsonl`. Where the momentum literature says this signal family lives,
+  and where wins pay 100% instead of 92%. No orders — measurement first, same as PO was.
+
+- **Funding-rate harvester, paper mode** (`npm run funding`): the structural-yield stream.
+  Polls public Binance + Bybit funding rates, opens paper delta-neutral positions when
+  annualized funding ≥ `FUNDING_ENTER_APR`, closes below `FUNDING_EXIT_APR`, accrues at the
+  live rate, charges round-trip fees, journals everything to `logs/funding.jsonl`. The report
+  shows realized paper APY with the same honesty as the streak logs.
+
+- **Portfolio view** (end of `npm run report`): per-stream PnL, max drawdown, and daily-PnL
+  correlation between streams — the numbers allocation decisions are made from. Capital
+  follows the evidence.
+
 ## Roadmap
-- **Phase 5** — access: login-protected realtime dashboard (anon key + read policies), CSV export.
+- **Next** — crypto auto-execution behind the risk manager once a crypto bucket validates;
+  live funding execution (trade-only API keys, withdrawals disabled) once paper APY matches
+  prediction; login-protected realtime dashboard (anon key + read policies), CSV export.
 
 ## Security notes (from the brief, section 10)
 - Pocket Option password is **never** stored — you log in by hand; only cookies/localStorage are saved locally.

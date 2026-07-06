@@ -16,8 +16,9 @@
  */
 import fs from 'node:fs';
 import { paths } from '../config.js';
-import type { OutcomeRecord } from '../scanner/outcomes.js';
-import { classifyAsset, edgeStats, loadOutcomes, rideAt, type EdgeStats } from '../scanner/edge.js';
+import type { OutcomeRecord, RideOutcome } from '../scanner/outcomes.js';
+import { classifyAsset, edgeStats, loadOutcomes, rideAt, splitHoldout, type EdgeStats } from '../scanner/edge.js';
+import { portfolioSection } from './portfolio.js';
 
 const pf = (x: number) => `${(x * 100).toFixed(1)}%`;
 
@@ -101,6 +102,31 @@ function main(): void {
     row(`ride: ${String(b).padStart(2, '0')}–${String(b + 3).padStart(2, '0')}h UTC`, score(sel, 'ride', 1));
   }
 
+  // ── Realistic entry: the edge at the price you actually get. ──
+  const realRecs = records.filter((r) => r.rideReal && r.rideReal.length > 0);
+  if (realRecs.length > 0) {
+    console.log(`\nREALISTIC ENTRY (+${realRecs[0]!.entryRealDelaySec ?? 10}s slippage, ${realRecs.length} records, 1-candle expiry)`);
+    const scoreReal = (recs: OutcomeRecord[]): Tally => {
+      const t = tally();
+      for (const r of recs) {
+        const res = r.rideReal?.[0] as RideOutcome | undefined;
+        if (res === 'win') { t.wins++; t.payoutSum += r.payout ?? 92; }
+        else if (res === 'loss') { t.losses++; t.payoutSum += r.payout ?? 92; }
+        else if (res === 'flat') t.flats++;
+        else t.voids++;
+      }
+      return t;
+    };
+    row('ride @ next-open (same records)', score(realRecs, 'ride', 1));
+    row('ride @ realistic entry', scoreReal(realRecs));
+    const ideal = statsOf(score(realRecs, 'ride', 1));
+    const real = statsOf(scoreReal(realRecs));
+    if (ideal.n >= 30 && real.n >= 30) {
+      const gap = ideal.winRate - real.winRate;
+      console.log(`  → slippage costs ${pf(Math.abs(gap))} win rate ${gap > 0 ? '(entry delay HURTS — automate execution)' : '(no measurable cost yet)'}`);
+    }
+  }
+
   console.log('\nRIDE BY ASSET (top 15 by sample size, 1-candle expiry)');
   const bySym = new Map<string, OutcomeRecord[]>();
   for (const r of records) {
@@ -112,23 +138,64 @@ function main(): void {
     .slice(0, 15)
     .forEach(([k, rs]) => row(`ride: ${k}`, score(rs, 'ride', 1)));
 
+  // ── Holdout validation: an edge is only real if it shows up in BOTH
+  // chronological halves. Kills buckets that only look good because we
+  // scanned dozens of slices (multiple-comparisons trap). ──
+  const [halfA, halfB] = splitHoldout(records);
+  const holdout = (recs: OutcomeRecord[], dir: 'ride' | 'fade'): { full: EdgeStats; a: EdgeStats; b: EdgeStats; pass: boolean } => {
+    const inHalf = (half: OutcomeRecord[]) => {
+      const keys = new Set(half.map((r) => `${r.symbol}|${r.alertPeriodStart}`));
+      return recs.filter((r) => keys.has(`${r.symbol}|${r.alertPeriodStart}`));
+    };
+    const full = statsOf(score(recs, dir, 1));
+    const a = statsOf(score(inHalf(halfA), dir, 1));
+    const b = statsOf(score(inHalf(halfB), dir, 1));
+    // Pass = positive EV in both halves with a workable sample in each.
+    const pass = a.n >= 20 && b.n >= 20 && a.ev > 0 && b.ev > 0;
+    return { full, a, b, pass };
+  };
+
+  console.log(`\nHOLDOUT VALIDATION (chronological halves: ${halfA.length} + ${halfB.length} records)`);
+  const holdoutBuckets: [string, OutcomeRecord[], 'ride' | 'fade'][] = [
+    ['ride forex', ofClass('forex'), 'ride'],
+    ['ride crypto', ofClass('crypto'), 'ride'],
+    ['ride stock/index', ofClass('stock/index'), 'ride'],
+  ];
+  const holdoutResult = new Map<string, boolean>();
+  for (const [name, recs, dir] of holdoutBuckets) {
+    const h = holdout(recs, dir);
+    holdoutResult.set(name, h.pass);
+    const half = (s: EdgeStats) => s.n === 0 ? 'n=0' : `EV ${(s.ev >= 0 ? '+' : '') + pf(s.ev)} (n=${s.n})`;
+    console.log(`  ${name.padEnd(20)} 1st half: ${half(h.a).padEnd(20)} 2nd half: ${half(h.b).padEnd(20)} → ${h.pass ? 'PASS ✅' : h.a.n < 20 || h.b.n < 20 ? 'insufficient' : 'FAIL ❌'}`);
+  }
+
   // The punchline: everything currently worth acting on.
   console.log('\n─────────────────────────────────────────────────────');
-  console.log('  VERDICTS');
-  const buckets: [string, Tally][] = [
-    ['ride forex (1-candle)', score(ofClass('forex'), 'ride', 1)],
-    ['ride crypto (1-candle)', score(ofClass('crypto'), 'ride', 1)],
-    ['ride stock/index (1-candle)', score(ofClass('stock/index'), 'ride', 1)],
-    ['fade crypto (1-candle)', score(ofClass('crypto'), 'fade', 1)],
+  console.log('  VERDICTS  (GRADUATED stats + holdout pass = tradeable)');
+  const buckets: [string, Tally, string | null][] = [
+    ['ride forex (1-candle)', score(ofClass('forex'), 'ride', 1), 'ride forex'],
+    ['ride crypto (1-candle)', score(ofClass('crypto'), 'ride', 1), 'ride crypto'],
+    ['ride stock/index (1-candle)', score(ofClass('stock/index'), 'ride', 1), 'ride stock/index'],
+    ['fade crypto (1-candle)', score(ofClass('crypto'), 'fade', 1), null],
   ];
   let anyTradeable = false;
-  for (const [name, t] of buckets) {
+  for (const [name, t, holdoutKey] of buckets) {
     const st = statsOf(t);
-    if (st.status === 'GRADUATED') { console.log(`  ✅ ${name}: VALIDATED — EV ${pf(st.ev)} even at CI floor (${pf(st.evLo)}). Tradeable at flat 1% stakes.`); anyTradeable = true; }
-    else if (st.status === 'candidate') console.log(`  🟡 ${name}: promising (EV ${(st.ev >= 0 ? '+' : '') + pf(st.ev)}, n=${st.n}) but NOT validated — paper trade only, need n≥200 with CI floor > 0.`);
+    const hPass = holdoutKey ? holdoutResult.get(holdoutKey) ?? false : false;
+    if (st.status === 'GRADUATED' && hPass) {
+      console.log(`  ✅ ${name}: VALIDATED — EV ${pf(st.ev)} at CI floor ${pf(st.evLo)}, positive in both holdout halves. Tradeable (size via risk manager).`);
+      anyTradeable = true;
+    } else if (st.status === 'GRADUATED' && !hPass) {
+      console.log(`  ⚠️ ${name}: graduated on the full sample but FAILED holdout — likely luck from slicing. PAPER ONLY until both halves are positive.`);
+    } else if (st.status === 'candidate') {
+      console.log(`  🟡 ${name}: promising (EV ${(st.ev >= 0 ? '+' : '') + pf(st.ev)}, n=${st.n}) but NOT validated — paper trade only, need n≥200, CI floor > 0, holdout pass.`);
+    }
   }
-  if (!anyTradeable) console.log('  ⛔ Nothing has graduated yet — no real-money trades. Keep collecting.');
+  if (!anyTradeable) console.log('  ⛔ Nothing has fully validated yet — no real-money trades. Keep collecting.');
   console.log('─────────────────────────────────────────────────────\n');
+
+  // ── Phase 5: the whole operation at a glance. ──
+  portfolioSection();
 }
 
 main();
