@@ -35,11 +35,31 @@ function fmtTime(epochSec: number): string {
   return new Date(epochSec * 1000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
-export function formatAlert(alert: StreakAlert, timeframeSec: number, label?: string, payout?: number): string {
+/**
+ * The trade instruction stamped onto an alert. `action: 'RIDE'` means bet the
+ * streak CONTINUES (CALL on a green streak, PUT on a red one) — the direction
+ * the outcome data supports. `OBSERVE` = no measured positive edge; watch,
+ * don't trade. `note` carries the evidence (win rate, n, EV, status).
+ */
+export interface TradeAdvice {
+  action: 'RIDE' | 'OBSERVE';
+  note: string;
+}
+
+export function formatAlert(alert: StreakAlert, timeframeSec: number, label?: string, payout?: number, advice?: TradeAdvice): string {
   const dot = alert.colour === 'red' ? '🔴' : '🟢';
   const name = prettySymbol(alert.symbol, label);
+  const adviceLines = advice
+    ? advice.action === 'RIDE'
+      ? [
+          `▶ TRADE: ${alert.colour === 'green' ? 'CALL / Higher ⬆' : 'PUT / Lower ⬇'} — ride the ${alert.colour} streak, ${timeframeLabel(timeframeSec)} expiry`,
+          `Edge: ${advice.note}`,
+        ]
+      : [`👁 OBSERVE ONLY — ${advice.note}`]
+    : [];
   return [
     `${dot} ${name} - ${alert.count} ${alert.colour} candles`,
+    ...adviceLines,
     ...(payout !== undefined ? [`Payout: ${payout}%`] : []),
     `Timeframe: ${timeframeLabel(timeframeSec)}`,
     `Last candle time: ${fmtTime(alert.candle.periodStart)} UTC`,

@@ -1,18 +1,27 @@
 /**
- * Alert outcome tracking (#1 on the hardening list).
+ * Alert outcome tracking (#1 on the hardening list) — v2, multi-expiry.
  *
- * Every sent alert is registered here; when the NEXT candle for that symbol
- * closes, the outcome is resolved and appended to a JSONL log:
+ * Every sent alert is registered here and scored against the candles that
+ * follow it, exactly the way a binary trade placed at the alert would resolve:
+ * entry (strike) = open of the NEXT candle, then win/loss at 1-, 2- and
+ * 3-candle expiries by comparing that candle's close to the strike.
+ *
+ * The legacy `outcome` field keeps its original meaning (next candle's colour
+ * vs. the streak):
  *
  *   reversal      — the next candle closed against the streak direction
- *                   (the "streak exhaustion" hypothesis won)
- *   continuation  — the next candle extended the streak (hypothesis lost)
+ *   continuation  — the next candle extended the streak
  *   doji          — the next candle closed exactly flat (broker refund case)
  *   void          — the next candle was never seen (feed gap) → not scoreable
  *
- * The next candle's RAW colour (exact open/close compare, no body filter) is
- * used because that is how a binary option actually pays out. Full OHLC is
- * recorded so stricter definitions can be analysed later from the log.
+ * v2 adds per-record features (asset class, last-candle body/range, entry
+ * price) and `ride[]` — the RIDE-the-streak result at each expiry — so the
+ * report can measure both directions at three expiries from one log.
+ *
+ * A record is appended to the JSONL only when fully resolved (all three
+ * expiries scored or voided); the record object is RETURNED to the caller at
+ * first resolution so console/Supabase behaviour is unchanged. Call `tick()`
+ * periodically to time out pendings whose candles never arrive.
  *
  * Analyse with:  npm run report
  */
@@ -21,89 +30,209 @@ import path from 'node:path';
 import type { Candle } from './candles.js';
 import { colourOf, type StreakAlert } from './streaks.js';
 
+export const EXPIRIES = 3;
+/** Give rotation/backfill this long to deliver the post-alert candles. */
+const FINALIZE_TIMEOUT_SEC = 15 * 60;
+
+export type RideOutcome = 'win' | 'loss' | 'flat' | 'void';
+
+interface NextCandle { periodStart: number; open: number; high: number; low: number; close: number }
+
 export interface OutcomeRecord {
-  /** ISO timestamp when the outcome was resolved. */
+  /** ISO timestamp when the outcome was first resolved. */
   at: string;
   symbol: string;
   label?: string;
   payout?: number;
+  /** PO catalog class of the asset (currency/cryptocurrency/stock/…). */
+  assetType?: string;
   /** Streak length and colour that triggered the alert. */
   streak: number;
   colour: 'green' | 'red';
   timeframeSec: number;
   /** periodStart (epoch sec) of the streak's last candle. */
   alertPeriodStart: number;
+  /** Final streak candle's body and range — trend strength at alert time. */
+  lastBody?: number;
+  lastRange?: number;
+  /** Simulated strike: open of the first post-alert candle. */
+  entry?: number;
+  /** Legacy 1-candle result (next candle's colour vs. the streak). */
   outcome: 'reversal' | 'continuation' | 'doji' | 'void';
-  /** The candle that resolved it (absent for void). */
-  next?: { periodStart: number; open: number; high: number; low: number; close: number };
+  /** The candle that resolved expiry 1 (absent for void). */
+  next?: NextCandle;
+  /** RIDE-the-streak result at expiry 1..3 (close vs. entry). */
+  ride?: RideOutcome[];
+  /** Post-alert candles 1..3 (null where that minute never arrived). */
+  nexts?: (NextCandle | null)[];
 }
 
 interface Pending {
   alert: StreakAlert;
   payout?: number;
   label?: string;
-  /** periodStart the resolving candle must have. */
-  expected: number;
+  assetType?: string;
+  /** Next expiry to resolve (1-based). */
+  expiry: number;
+  entry?: number;
+  ride: RideOutcome[];
+  nexts: (NextCandle | null)[];
+  record?: OutcomeRecord;
+  /** Epoch sec after which unresolved expiries are declared void. */
+  deadline: number;
 }
 
 export class OutcomeTracker {
-  private readonly pending = new Map<string, Pending>();
+  private readonly pending = new Map<string, Pending[]>();
   private readonly counts = { reversal: 0, continuation: 0, doji: 0, void: 0 };
 
-  /** `file` optional so the tracker can run in-memory (tests). */
-  constructor(private readonly file?: string) {
+  /** `file` optional so the tracker can run in-memory (tests); `onFinal`
+   *  fires when a record is fully resolved (all expiries) — tests/EdgeBook. */
+  constructor(
+    private readonly file?: string,
+    private readonly onFinal?: (rec: OutcomeRecord) => void,
+  ) {
     if (file) fs.mkdirSync(path.dirname(file), { recursive: true });
   }
 
   /** Call when an alert is actually sent. */
-  register(alert: StreakAlert, meta: { payout?: number; label?: string } = {}): void {
-    this.pending.set(alert.symbol, {
+  register(alert: StreakAlert, meta: { payout?: number; label?: string; assetType?: string } = {}): void {
+    const list = this.pending.get(alert.symbol) ?? [];
+    list.push({
       alert,
       ...meta,
-      expected: alert.candle.periodStart + alert.candle.timeframeSec,
+      expiry: 1,
+      ride: [],
+      nexts: [],
+      deadline: alert.candle.periodStart + (EXPIRIES + 1) * alert.candle.timeframeSec + FINALIZE_TIMEOUT_SEC,
     });
+    this.pending.set(alert.symbol, list);
   }
 
   /**
    * Feed EVERY closed candle (before the streak engine, so an alert fired by
-   * this same candle registers fresh afterwards). Returns the resolved
-   * outcome, if this candle settled one.
+   * this same candle registers fresh afterwards). Returns records that just
+   * got their FIRST (expiry-1) resolution — print/persist those as before.
    */
-  onCandle(candle: Candle): OutcomeRecord | null {
-    const p = this.pending.get(candle.symbol);
-    if (!p || candle.periodStart < p.expected) return null;
-    this.pending.delete(candle.symbol);
+  onCandle(candle: Candle): OutcomeRecord[] {
+    const list = this.pending.get(candle.symbol);
+    if (!list || list.length === 0) return [];
+    const resolved: OutcomeRecord[] = [];
+    for (const p of [...list]) {
+      const rec = this.advance(p, candle);
+      if (rec) resolved.push(rec);
+      if (p.expiry > EXPIRIES) this.finalize(candle.symbol, p);
+    }
+    return resolved;
+  }
 
-    const gap = candle.periodStart > p.expected;
-    const nextColour = gap ? null : colourOf(candle); // raw colour = payout truth
+  /** Time out pendings whose candles never arrived. Call ~once a second. */
+  tick(nowSec: number): OutcomeRecord[] {
+    const resolved: OutcomeRecord[] = [];
+    for (const [symbol, list] of this.pending) {
+      for (const p of [...list]) {
+        if (nowSec < p.deadline) continue;
+        if (p.expiry === 1) {
+          resolved.push(this.firstResolve(p, null));
+        }
+        while (p.expiry <= EXPIRIES) { p.ride.push('void'); p.nexts.push(null); p.expiry++; }
+        this.finalize(symbol, p);
+      }
+    }
+    return resolved;
+  }
+
+  /** Apply one candle to one pending; returns the record on first resolution. */
+  private advance(p: Pending, candle: Candle): OutcomeRecord | null {
+    const tf = p.alert.candle.timeframeSec;
+    let first: OutcomeRecord | null = null;
+    while (p.expiry <= EXPIRIES) {
+      const expected = p.alert.candle.periodStart + p.expiry * tf;
+      if (candle.periodStart < expected) break; // not there yet
+      if (candle.periodStart > expected) {
+        // That minute never arrived (feed gap): void this expiry, keep going —
+        // a later expiry can still score off the same entry price.
+        if (p.expiry === 1) {
+          // Entry price unknown → nothing is scoreable. Void the whole trade.
+          first = this.firstResolve(p, null);
+          while (p.expiry <= EXPIRIES) { p.ride.push('void'); p.nexts.push(null); p.expiry++; }
+          return first;
+        }
+        p.ride.push('void');
+        p.nexts.push(null);
+        p.expiry++;
+        continue;
+      }
+      // candle.periodStart === expected → score this expiry.
+      const nc: NextCandle = { periodStart: candle.periodStart, open: candle.open, high: candle.high, low: candle.low, close: candle.close };
+      if (p.expiry === 1) {
+        p.entry = candle.open;
+        first = this.firstResolve(p, nc);
+      }
+      const entry = p.entry!;
+      const ride: RideOutcome =
+        candle.close === entry ? 'flat'
+        : (p.alert.colour === 'green' ? candle.close > entry : candle.close < entry) ? 'win'
+        : 'loss';
+      p.ride.push(ride);
+      p.nexts.push(nc);
+      p.expiry++;
+      break; // one candle scores at most one expiry
+    }
+    return first;
+  }
+
+  /** Build the record at expiry-1 resolution (candle, or null = void). */
+  private firstResolve(p: Pending, next: NextCandle | null): OutcomeRecord {
+    const nextColour = next ? colourOf({ ...next, symbol: p.alert.symbol, timeframeSec: p.alert.candle.timeframeSec, ticks: 0 }) : null;
     const outcome: OutcomeRecord['outcome'] =
-      gap ? 'void'
+      next === null ? 'void'
       : nextColour === 'doji' ? 'doji'
       : nextColour === p.alert.colour ? 'continuation'
       : 'reversal';
     this.counts[outcome]++;
-
-    const rec: OutcomeRecord = {
+    const c = p.alert.candle;
+    p.record = {
       at: new Date().toISOString(),
       symbol: p.alert.symbol,
       label: p.label,
       payout: p.payout,
+      assetType: p.assetType,
       streak: p.alert.count,
       colour: p.alert.colour,
-      timeframeSec: p.alert.candle.timeframeSec,
-      alertPeriodStart: p.alert.candle.periodStart,
+      timeframeSec: c.timeframeSec,
+      alertPeriodStart: c.periodStart,
+      lastBody: Math.abs(c.close - c.open),
+      lastRange: c.high - c.low,
+      ...(next ? { entry: next.open } : {}),
       outcome,
-      ...(gap ? {} : { next: { periodStart: candle.periodStart, open: candle.open, high: candle.high, low: candle.low, close: candle.close } }),
+      ...(next ? { next } : {}),
     };
+    return p.record;
+  }
+
+  /** All expiries resolved/voided: attach arrays, write to disk, drop pending. */
+  private finalize(symbol: string, p: Pending): void {
+    const list = this.pending.get(symbol);
+    if (list) {
+      const i = list.indexOf(p);
+      if (i >= 0) list.splice(i, 1);
+      if (list.length === 0) this.pending.delete(symbol);
+    }
+    const rec = p.record;
+    if (!rec) return;
+    rec.ride = p.ride;
+    rec.nexts = p.nexts;
     if (this.file) fs.appendFileSync(this.file, `${JSON.stringify(rec)}\n`);
-    return rec;
+    this.onFinal?.(rec);
   }
 
   /** One-line session summary for status lines / heartbeats. */
   summary(): string {
     const { reversal, continuation, doji, void: v } = this.counts;
     const decided = reversal + continuation;
-    const rate = decided > 0 ? `${((reversal / decided) * 100).toFixed(1)}%` : '—';
-    return `outcomes: ${reversal}W/${continuation}L rev-rate ${rate}${doji ? ` doji ${doji}` : ''}${v ? ` gap ${v}` : ''}`;
+    // W/L from the RIDE perspective now: continuation = the ride trade won.
+    const rate = decided > 0 ? `${((continuation / decided) * 100).toFixed(1)}%` : '—';
+    return `outcomes: ${continuation}W/${reversal}L ride-rate ${rate}${doji ? ` doji ${doji}` : ''}${v ? ` gap ${v}` : ''}`;
   }
 }

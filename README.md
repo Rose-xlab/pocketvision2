@@ -108,9 +108,19 @@ Hardening (all tunable in `.env`):
 - **Watchdog + heartbeat** (`STALE_FEED_SEC`, `HEARTBEAT_MIN`): no ticks for 60 s → Telegram
   warning + automatic page reload/reconnect (and a "recovered" message); an hourly 💓 ping
   proves the bot is alive, so silence always means "no signals", never "bot died".
-- **Outcome tracking**: every alert's next candle is scored reversal/continuation/doji and
-  appended to `logs/outcomes.jsonl`; `npm run report` breaks win rates down by asset, streak
-  length, and hour — the evidence for whether (and where) the signal is profitable.
+- **Outcome tracking v2 (trade intelligence)**: every alert is scored the way a real binary
+  trade would resolve — entry = open of the next candle, win/loss at 1-, 2- and 3-candle
+  expiries — with features (asset class, body/range, payout) appended to `logs/outcomes.jsonl`.
+  Old-format records stay readable.
+- **Directional alerts with evidence**: the 2026-07-03/04 data proved fading streaks LOSES
+  (46.8% win, EV −10%) while RIDING them is promising (forex: 57.3%, EV +9.8%). Alerts now
+  carry a trade instruction (`TRADE: CALL/PUT — ride the streak`) stamped with the live
+  measured edge for that asset class (win rate, n, CI, EV), or `OBSERVE ONLY` where no
+  positive edge exists. A setup is marked VALIDATED only when its CI lower bound is
+  profitable on n ≥ 200 — until then every alert says PAPER ONLY.
+- **Edge dashboard**: `npm run report` prints EV + Wilson 95% CI per direction × asset class,
+  streak length, expiry, and hour, ending in explicit verdicts (GRADUATED / paper only /
+  do not trade) — the evidence layer that decides what is ever traded with real money.
 - **Dynamic watchlist** (`WATCHLIST_REFRESH_MIN=10`): the watchlist is rebuilt from live
   payouts/market hours during the session — pairs that drop below the floor are disconnected,
   newly eligible ones are added.

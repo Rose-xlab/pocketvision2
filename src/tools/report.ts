@@ -1,46 +1,55 @@
 /**
- * Outcome report — answers "does the streak signal actually win?" from the
- * JSONL log the scanner writes (logs/outcomes.jsonl).
+ * Edge dashboard — answers "where is the money?" from logs/outcomes.jsonl.
  *
- * "Win" here = REVERSAL: the candle after the alert closed against the streak
- * (the strategy the alerts imply — trade against streak exhaustion). The
- * continuation rate is simply the complement. Doji/void records are shown but
- * excluded from win-rate math. Break-even win rate for a payout P% is
- * 100/(100+P) — e.g. 92% payout → 52.1%.
+ * For every setup bucket it prints the win rate with a Wilson 95% CI and the
+ * expected value per unit staked at the bucket's real average payout, in BOTH
+ * directions (RIDE = bet continuation, FADE = bet reversal), plus multi-expiry
+ * results for records captured by the v2 tracker.
+ *
+ * Status column:
+ *   GRADUATED    — even the CI lower bound is profitable on n ≥ 200: tradeable
+ *   candidate    — positive EV but the CI still spans break-even: PAPER ONLY
+ *   negative     — losing at the observed rate
+ *   insufficient — n < 30, ignore the numbers
  *
  * Run:  npm run report
  */
 import fs from 'node:fs';
 import { paths } from '../config.js';
 import type { OutcomeRecord } from '../scanner/outcomes.js';
+import { classifyAsset, edgeStats, loadOutcomes, rideAt, type EdgeStats } from '../scanner/edge.js';
 
-function pct(n: number, d: number): string {
-  return d > 0 ? `${((n / d) * 100).toFixed(1)}%` : '—';
-}
+const pf = (x: number) => `${(x * 100).toFixed(1)}%`;
 
-interface Bucket { reversal: number; continuation: number; doji: number; void: number }
-const newBucket = (): Bucket => ({ reversal: 0, continuation: 0, doji: 0, void: 0 });
+interface Tally { wins: number; losses: number; flats: number; voids: number; payoutSum: number }
+const tally = (): Tally => ({ wins: 0, losses: 0, flats: 0, voids: 0, payoutSum: 0 });
 
-function addTo(map: Map<string, Bucket>, key: string, outcome: OutcomeRecord['outcome']): void {
-  const b = map.get(key) ?? newBucket();
-  b[outcome]++;
-  map.set(key, b);
-}
-
-function printTable(title: string, map: Map<string, Bucket>): void {
-  console.log(`\n${title}`);
-  console.log('  key                     n    rev  cont  doji  gap   rev-rate');
-  const rows = [...map.entries()].sort((a, b) => {
-    const na = a[1].reversal + a[1].continuation;
-    const nb = b[1].reversal + b[1].continuation;
-    return nb - na;
-  });
-  for (const [key, b] of rows) {
-    const decided = b.reversal + b.continuation;
-    console.log(
-      `  ${key.padEnd(22)}${String(decided + b.doji + b.void).padStart(4)}  ${String(b.reversal).padStart(5)} ${String(b.continuation).padStart(5)} ${String(b.doji).padStart(5)} ${String(b.void).padStart(4)}   ${pct(b.reversal, decided).padStart(6)}`,
-    );
+/** Score `recs` in one direction ('ride' wins on continuation) at an expiry. */
+function score(recs: OutcomeRecord[], dir: 'ride' | 'fade', expiry: number): Tally {
+  const t = tally();
+  for (const r of recs) {
+    const ride = rideAt(r, expiry);
+    if (ride === undefined) continue; // old record, no data at this expiry
+    const res = dir === 'ride' ? ride : ride === 'win' ? 'loss' : ride === 'loss' ? 'win' : ride;
+    if (res === 'win') { t.wins++; t.payoutSum += r.payout ?? 92; }
+    else if (res === 'loss') { t.losses++; t.payoutSum += r.payout ?? 92; }
+    else if (res === 'flat') t.flats++;
+    else t.voids++;
   }
+  return t;
+}
+
+function statsOf(t: Tally): EdgeStats {
+  return edgeStats(t.wins, t.losses, t.payoutSum);
+}
+
+function row(name: string, t: Tally): void {
+  const s = statsOf(t);
+  if (s.n === 0) { console.log(`  ${name.padEnd(38)} n=0`); return; }
+  console.log(
+    `  ${name.padEnd(38)} n=${String(s.n).padStart(4)}  win=${pf(s.winRate).padStart(6)}  ` +
+    `CI=[${pf(s.ci[0])},${pf(s.ci[1])}]  EV=${(s.ev >= 0 ? '+' : '') + pf(s.ev).padStart(5)}  ${s.status}`,
+  );
 }
 
 function main(): void {
@@ -48,46 +57,78 @@ function main(): void {
     console.log(`No outcome log yet at ${paths.outcomesFile} — run the scanner first (npm run scan).`);
     return;
   }
-  const records: OutcomeRecord[] = fs
-    .readFileSync(paths.outcomesFile, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as OutcomeRecord);
-
+  const records = loadOutcomes(paths.outcomesFile);
   if (records.length === 0) {
     console.log('Outcome log is empty — no resolved alerts yet.');
     return;
   }
 
-  const total = newBucket();
-  const bySymbol = new Map<string, Bucket>();
-  const byStreak = new Map<string, Bucket>();
-  const byHour = new Map<string, Bucket>();
-  for (const r of records) {
-    total[r.outcome]++;
-    addTo(bySymbol, r.label ?? r.symbol, r.outcome);
-    addTo(byStreak, `streak ${r.streak}`, r.outcome);
-    addTo(byHour, `${String(new Date(r.alertPeriodStart * 1000).getUTCHours()).padStart(2, '0')}:00 UTC`, r.outcome);
-  }
-
-  const decided = total.reversal + total.continuation;
+  const v2 = records.filter((r) => r.ride && r.ride.length > 0).length;
   const first = records[0]!.at.slice(0, 10);
   const last = records[records.length - 1]!.at.slice(0, 10);
-  console.log('─────────────────────────────────────────────────────');
-  console.log('  ALERT OUTCOME REPORT');
-  console.log(`  ${records.length} resolved alerts, ${first} → ${last}`);
-  console.log('─────────────────────────────────────────────────────');
-  console.log(`  Reversal (win):      ${total.reversal}  (${pct(total.reversal, decided)})`);
-  console.log(`  Continuation (loss): ${total.continuation}  (${pct(total.continuation, decided)})`);
-  console.log(`  Doji (refund):       ${total.doji}`);
-  console.log(`  Void (feed gap):     ${total.void}`);
-  console.log('  Break-even at 92% payout is 52.1% — below that, the signal loses money.');
-  if (decided < 100) console.log(`  ⚠ Only ${decided} decided outcomes — treat every rate below as noise until ~100+.`);
+  const overallRide = score(records, 'ride', 1);
+  const s = statsOf(overallRide);
 
-  printTable('BY ASSET (most data first)', bySymbol);
-  printTable('BY STREAK LENGTH', byStreak);
-  printTable('BY HOUR OF ALERT (UTC)', byHour);
-  console.log();
+  console.log('═════════════════════════════════════════════════════');
+  console.log('  EDGE DASHBOARD');
+  console.log(`  ${records.length} resolved alerts (${v2} multi-expiry), ${first} → ${last}`);
+  console.log('═════════════════════════════════════════════════════');
+  console.log(`  Ride wins ${overallRide.wins} / losses ${overallRide.losses} / flat ${overallRide.flats} / void ${overallRide.voids}`);
+  console.log(`  Break-even at avg payout ${pf(s.avgPayout)} is ${pf(s.breakEven)} win rate.`);
+  console.log('  GRADUATED = tradeable | candidate = PAPER ONLY | rest = do not trade.');
+
+  console.log('\nDIRECTION × ASSET CLASS (1-candle expiry)');
+  const classes = ['forex', 'crypto', 'stock/index'] as const;
+  const ofClass = (c: string) => records.filter((r) => classifyAsset(r.assetType, r.label, r.symbol) === c);
+  row('RIDE: all', score(records, 'ride', 1));
+  for (const c of classes) row(`RIDE: ${c}`, score(ofClass(c), 'ride', 1));
+  row('FADE: all', score(records, 'fade', 1));
+  for (const c of classes) row(`FADE: ${c}`, score(ofClass(c), 'fade', 1));
+
+  console.log('\nRIDE BY MINIMUM STREAK (1-candle expiry)');
+  for (const t of [7, 8, 9, 10, 11]) row(`ride: streak >= ${t}`, score(records.filter((r) => r.streak >= t), 'ride', 1));
+
+  console.log('\nRIDE BY EXPIRY (v2 records only — grows as new data arrives)');
+  for (let e = 1; e <= 3; e++) {
+    const v2recs = records.filter((r) => r.ride && r.ride.length >= e);
+    row(`ride: all @ ${e}-candle expiry`, score(v2recs, 'ride', e));
+    row(`ride: forex @ ${e}-candle expiry`, score(v2recs.filter((r) => classifyAsset(r.assetType, r.label, r.symbol) === 'forex'), 'ride', e));
+  }
+
+  console.log('\nRIDE BY 4-HOUR BLOCK (UTC, 1-candle expiry)');
+  for (let b = 0; b < 24; b += 4) {
+    const sel = records.filter((r) => { const h = new Date(r.alertPeriodStart * 1000).getUTCHours(); return h >= b && h < b + 4; });
+    row(`ride: ${String(b).padStart(2, '0')}–${String(b + 3).padStart(2, '0')}h UTC`, score(sel, 'ride', 1));
+  }
+
+  console.log('\nRIDE BY ASSET (top 15 by sample size, 1-candle expiry)');
+  const bySym = new Map<string, OutcomeRecord[]>();
+  for (const r of records) {
+    const k = r.label ?? r.symbol;
+    (bySym.get(k) ?? bySym.set(k, []).get(k)!).push(r);
+  }
+  [...bySym.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, 15)
+    .forEach(([k, rs]) => row(`ride: ${k}`, score(rs, 'ride', 1)));
+
+  // The punchline: everything currently worth acting on.
+  console.log('\n─────────────────────────────────────────────────────');
+  console.log('  VERDICTS');
+  const buckets: [string, Tally][] = [
+    ['ride forex (1-candle)', score(ofClass('forex'), 'ride', 1)],
+    ['ride crypto (1-candle)', score(ofClass('crypto'), 'ride', 1)],
+    ['ride stock/index (1-candle)', score(ofClass('stock/index'), 'ride', 1)],
+    ['fade crypto (1-candle)', score(ofClass('crypto'), 'fade', 1)],
+  ];
+  let anyTradeable = false;
+  for (const [name, t] of buckets) {
+    const st = statsOf(t);
+    if (st.status === 'GRADUATED') { console.log(`  ✅ ${name}: VALIDATED — EV ${pf(st.ev)} even at CI floor (${pf(st.evLo)}). Tradeable at flat 1% stakes.`); anyTradeable = true; }
+    else if (st.status === 'candidate') console.log(`  🟡 ${name}: promising (EV ${(st.ev >= 0 ? '+' : '') + pf(st.ev)}, n=${st.n}) but NOT validated — paper trade only, need n≥200 with CI floor > 0.`);
+  }
+  if (!anyTradeable) console.log('  ⛔ Nothing has graduated yet — no real-money trades. Keep collecting.');
+  console.log('─────────────────────────────────────────────────────\n');
 }
 
 main();

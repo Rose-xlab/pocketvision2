@@ -17,10 +17,11 @@ import { openPersistentContext, firstPage, dismissPopups } from '../lib/browser.
 import { attachCapture } from '../phase1/capture.js';
 import { CandleBuilder, type Tick, type Candle } from './candles.js';
 import { StreakEngine } from './streaks.js';
-import { TelegramSender, formatAlert } from '../lib/telegram.js';
+import { TelegramSender, formatAlert, type TradeAdvice } from '../lib/telegram.js';
 import { SupabaseSink } from '../lib/supabase.js';
 import { installFeed } from './feed-inject.js';
-import { OutcomeTracker } from './outcomes.js';
+import { OutcomeTracker, type OutcomeRecord } from './outcomes.js';
+import { EdgeBook, classifyAsset } from './edge.js';
 
 /**
  * Resolves on ENTER (interactive) or SIGINT/SIGTERM (Ctrl+C, systemd stop).
@@ -51,8 +52,29 @@ async function main() {
   const labels = new Map<string, string>();
   const catalog = new Map<string, { isOpen: boolean; otc: boolean; payout: number; type: string }>();
   const tracker = new OutcomeTracker(paths.outcomesFile);
+  // Seed the edge book from the full outcome history, then keep it current —
+  // every alert is stamped with the measured edge for its asset class.
+  const edgeBook = new EdgeBook(paths.outcomesFile);
   let alertCount = 0;
   let lastTickAt = Date.now();
+
+  const adviceFor = (symbol: string): TradeAdvice => {
+    const cls = classifyAsset(catalog.get(symbol)?.type, labels.get(symbol), symbol);
+    const s = edgeBook.rideStats(cls);
+    const pf = (x: number) => `${(x * 100).toFixed(1)}%`;
+    const stats = `${cls} ride: ${pf(s.winRate)} win (n=${s.n}, CI ${pf(s.ci[0])}–${pf(s.ci[1])}), EV ${s.ev >= 0 ? '+' : ''}${pf(s.ev)}`;
+    if (s.status === 'GRADUATED') return { action: 'RIDE', note: `${stats} — VALIDATED ✅` };
+    if (s.status === 'candidate') return { action: 'RIDE', note: `${stats} — PAPER ONLY (not yet validated)` };
+    if (s.status === 'insufficient') return { action: 'OBSERVE', note: `${stats} — not enough data yet` };
+    return { action: 'OBSERVE', note: `no positive edge measured — ${stats}` };
+  };
+
+  const handleOutcome = (o: OutcomeRecord) => {
+    const verdict = o.outcome === 'continuation' ? 'ride WIN ✅' : o.outcome === 'reversal' ? 'ride LOSS ❌' : o.outcome;
+    console.log(`  📊 ${o.symbol}: ${verdict} after ${o.streak} ${o.colour} | ${tracker.summary()}`);
+    supabase.outcome(o);
+    edgeBook.add(o);
+  };
 
   // Per-symbol tick watermark: rotation revisits re-send overlapping history,
   // so every tick at or below the watermark has already been counted.
@@ -121,12 +143,8 @@ async function main() {
   };
 
   const onClosedCandle = (candle: Candle) => {
-    // Settle any pending alert outcome BEFORE the engine can register a new one.
-    const outcome = tracker.onCandle(candle);
-    if (outcome) {
-      console.log(`  📊 ${outcome.symbol}: ${outcome.outcome} after ${outcome.streak} ${outcome.colour} | ${tracker.summary()}`);
-      supabase.outcome(outcome);
-    }
+    // Settle any pending alert outcomes BEFORE the engine can register new ones.
+    for (const o of tracker.onCandle(candle)) handleOutcome(o);
 
     // Freshness gate: candles older than one sweep (+margin) are seeded
     // history (startup backfill) — track their streak state but never alert
@@ -143,12 +161,12 @@ async function main() {
         return;
       }
       alertCount++;
-      const msg = formatAlert(alert, config.timeframeSec, labels.get(alert.symbol), meta?.payout);
+      const msg = formatAlert(alert, config.timeframeSec, labels.get(alert.symbol), meta?.payout, adviceFor(alert.symbol));
       console.log('\n  ────────────────────────────────────────────');
       console.log(msg.split('\n').map((l) => `  🚨 ${l}`).join('\n'));
       console.log('  ────────────────────────────────────────────\n');
       telegram.enqueue(msg);
-      tracker.register(alert, { payout: meta?.payout, label: labels.get(alert.symbol) });
+      tracker.register(alert, { payout: meta?.payout, label: labels.get(alert.symbol), assetType: meta?.type });
       supabase.alert(alert, { payout: meta?.payout, label: labels.get(alert.symbol) }, config.timeframeSec);
     }
   };
@@ -270,7 +288,10 @@ async function main() {
     return liveRecently ? config.graceSec : Math.max(150, sweepSec() * 2 + 30);
   };
   const flusher = setInterval(() => {
-    for (const c of builder.flush(Date.now() / 1000, graceFor)) onClosedCandle(c);
+    const now = Date.now() / 1000;
+    for (const c of builder.flush(now, graceFor)) onClosedCandle(c);
+    // Time out alert outcomes whose post-alert candles never arrived.
+    for (const o of tracker.tick(now)) handleOutcome(o);
   }, 1000);
 
   const status = setInterval(async () => {
